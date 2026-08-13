@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import random
 import re
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
-from .errors import ProviderError, ValidationError
+from .errors import ModelOutputError, ProviderError, ValidationError
 from .models import (
     Edge,
     ModelRun,
@@ -151,6 +152,22 @@ VERIFY_SCHEMA: dict[str, Any] = {
     "required": ["verdicts", "overall_assessment", "follow_up_questions"],
 }
 
+SYNTHESIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "synthesis_markdown": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "uncertainties": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["synthesis_markdown", "confidence", "uncertainties", "open_questions"],
+}
+
+# One immediate retry when a provider returns content that fails to parse or validate. Transport
+# and HTTP failures are not retried here (those already carry their own ProviderError semantics).
+MAX_OUTPUT_ATTEMPTS = 2
+
 SYSTEM_PROMPT = """You are an evidence-first research partner for a serious writer.
 
 Research current information when web tools are available. Prefer primary sources: official
@@ -233,6 +250,16 @@ independent reproduction of that claim. News, SEO pages, copied leaderboards, an
 secondary even when they quote exact numbers. `mixed` requires at least one genuinely primary
 snapshot. Do not add, rename, or omit fields."""
 
+SYNTHESIS_CONTRACT = """Return JSON only, using exactly this shape:
+{
+  "synthesis_markdown": "a concise, evidence-weighted synthesis",
+  "confidence": 0.0,
+  "uncertainties": ["specific unresolved uncertainty"],
+  "open_questions": ["question that could resolve uncertainty"]
+}
+Do not add, rename, or omit fields. Use an empty array when a list has no items. Do not invent
+new facts, quotes, URLs, or citations; summarize only what the supplied answers contain."""
+
 
 @dataclass
 class ResearchOutcome:
@@ -242,6 +269,13 @@ class ResearchOutcome:
     run: ModelRun
     sources: list[Source]
     perspectives: list[Node]
+
+
+@dataclass
+class SynthesisOutcome:
+    node: Node
+    run: ModelRun
+    aggregated: list[str]
 
 
 @dataclass
@@ -262,13 +296,13 @@ def parse_json_content(content: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         start, end = text.find("{"), text.rfind("}")
         if start < 0 or end <= start:
-            raise ProviderError("model response was not valid structured JSON")
+            raise ModelOutputError("model response was not valid structured JSON")
         try:
             value = json.loads(text[start : end + 1])
         except json.JSONDecodeError as exc:
-            raise ProviderError(f"model response was not valid structured JSON: {exc}") from exc
+            raise ModelOutputError(f"model response was not valid structured JSON: {exc}") from exc
     if not isinstance(value, dict):
-        raise ProviderError("model response JSON was not an object")
+        raise ModelOutputError("model response JSON was not an object")
     return value
 
 
@@ -278,72 +312,72 @@ def validate_answer(value: dict[str, Any], *, council: bool = False) -> dict[str
         required += ["consensus", "disagreements"]
     missing = [name for name in required if name not in value]
     if missing:
-        raise ProviderError(f"model response is missing fields: {', '.join(missing)}")
+        raise ModelOutputError(f"model response is missing fields: {', '.join(missing)}")
     if not isinstance(value["answer_markdown"], str) or not value["answer_markdown"].strip():
-        raise ProviderError("model response contains no answer_markdown")
+        raise ModelOutputError("model response contains no answer_markdown")
     if isinstance(value["confidence"], bool):
-        raise ProviderError("model confidence is not numeric")
+        raise ModelOutputError("model confidence is not numeric")
     try:
         confidence = float(value["confidence"])
     except (TypeError, ValueError) as exc:
-        raise ProviderError("model confidence is not numeric") from exc
+        raise ModelOutputError("model confidence is not numeric") from exc
     if not 0 <= confidence <= 1:
-        raise ProviderError("model confidence is outside 0..1")
+        raise ModelOutputError("model confidence is outside 0..1")
     value["confidence"] = confidence
     for list_key in ("claims", "uncertainties", "follow_up_questions"):
         if not isinstance(value[list_key], list):
-            raise ProviderError(f"model field {list_key} is not a list")
+            raise ModelOutputError(f"model field {list_key} is not a list")
     if any(not isinstance(item, str) for item in value["uncertainties"]):
-        raise ProviderError("model uncertainties must contain only strings")
+        raise ModelOutputError("model uncertainties must contain only strings")
     for claim in value["claims"]:
         if not isinstance(claim, dict):
-            raise ProviderError("model claim is not an object")
+            raise ModelOutputError("model claim is not an object")
         text = claim.get("text")
         if not isinstance(text, str) or not text.strip():
-            raise ProviderError("model claim has no text")
+            raise ModelOutputError("model claim has no text")
         if isinstance(claim.get("confidence"), bool):
-            raise ProviderError("model claim confidence is not numeric")
+            raise ModelOutputError("model claim confidence is not numeric")
         try:
             claim_confidence = float(claim.get("confidence"))
         except (TypeError, ValueError) as exc:
-            raise ProviderError("model claim confidence is not numeric") from exc
+            raise ModelOutputError("model claim confidence is not numeric") from exc
         if not 0 <= claim_confidence <= 1:
-            raise ProviderError("model claim confidence is outside 0..1")
+            raise ModelOutputError("model claim confidence is outside 0..1")
         claim["confidence"] = claim_confidence
         source_urls = claim.get("source_urls")
         if not isinstance(source_urls, list) or any(
             not isinstance(url, str) or not url.startswith(("http://", "https://"))
             for url in source_urls
         ):
-            raise ProviderError("model claim source_urls must contain only HTTP(S) URLs")
+            raise ModelOutputError("model claim source_urls must contain only HTTP(S) URLs")
     for followup in value["follow_up_questions"]:
         if not isinstance(followup, dict):
-            raise ProviderError("model follow-up is not an object")
+            raise ModelOutputError("model follow-up is not an object")
         if not isinstance(followup.get("question"), str) or not followup["question"].strip():
-            raise ProviderError("model follow-up has no question")
+            raise ModelOutputError("model follow-up has no question")
         if not isinstance(followup.get("rationale"), str):
-            raise ProviderError("model follow-up rationale is not text")
+            raise ModelOutputError("model follow-up rationale is not text")
         priority = followup.get("priority")
         if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 5:
-            raise ProviderError("model follow-up priority must be an integer from 1 to 5")
+            raise ModelOutputError("model follow-up priority must be an integer from 1 to 5")
     if council:
         for list_key in ("consensus", "disagreements"):
             if not isinstance(value[list_key], list) or any(
                 not isinstance(item, str) for item in value[list_key]
             ):
-                raise ProviderError(f"model field {list_key} must contain only strings")
+                raise ModelOutputError(f"model field {list_key} must contain only strings")
     return value
 
 
 def validate_review(value: dict[str, Any], labels: set[str]) -> dict[str, Any]:
     missing = [name for name in REVIEW_SCHEMA["required"] if name not in value]
     if missing:
-        raise ProviderError(f"review response is missing fields: {', '.join(missing)}")
+        raise ModelOutputError(f"review response is missing fields: {', '.join(missing)}")
     strongest = value["strongest_response"]
     if not isinstance(strongest, str):
-        raise ProviderError("review strongest_response is not text")
+        raise ModelOutputError("review strongest_response is not text")
     if strongest not in {f"Response {label}" for label in labels}:
-        raise ProviderError(f"review selected an unknown response: {strongest}")
+        raise ModelOutputError(f"review selected an unknown response: {strongest}")
     for list_key in (
         "evidence_strengths",
         "unsupported_or_weak_claims",
@@ -353,7 +387,7 @@ def validate_review(value: dict[str, Any], labels: set[str]) -> dict[str, Any]:
         if not isinstance(value[list_key], list) or any(
             not isinstance(item, str) for item in value[list_key]
         ):
-            raise ProviderError(f"review field {list_key} must contain only strings")
+            raise ModelOutputError(f"review field {list_key} must contain only strings")
     return value
 
 
@@ -363,15 +397,15 @@ def validate_verification(
     claim_ids = set(claim_sources)
     missing = [name for name in VERIFY_SCHEMA["required"] if name not in value]
     if missing:
-        raise ProviderError(f"verification response is missing fields: {', '.join(missing)}")
+        raise ModelOutputError(f"verification response is missing fields: {', '.join(missing)}")
     if not isinstance(value["verdicts"], list):
-        raise ProviderError("verification verdicts is not a list")
+        raise ModelOutputError("verification verdicts is not a list")
     if not isinstance(value["overall_assessment"], str):
-        raise ProviderError("verification overall_assessment is not text")
+        raise ModelOutputError("verification overall_assessment is not text")
     if not isinstance(value["follow_up_questions"], list) or any(
         not isinstance(item, str) for item in value["follow_up_questions"]
     ):
-        raise ProviderError("verification follow_up_questions must contain only strings")
+        raise ModelOutputError("verification follow_up_questions must contain only strings")
     returned: set[str] = set()
     allowed_verdicts = {
         "supported",
@@ -382,18 +416,20 @@ def validate_verification(
     }
     for verdict in value["verdicts"]:
         if not isinstance(verdict, dict):
-            raise ProviderError("verification verdict is not an object")
+            raise ModelOutputError("verification verdict is not an object")
         claim_id = verdict.get("claim_id")
         if not isinstance(claim_id, str):
-            raise ProviderError("verification claim_id is not text")
+            raise ModelOutputError("verification claim_id is not text")
         if claim_id not in claim_ids or claim_id in returned:
-            raise ProviderError(f"verification returned an unknown or duplicate claim: {claim_id}")
+            raise ModelOutputError(
+                f"verification returned an unknown or duplicate claim: {claim_id}"
+            )
         returned.add(claim_id)
         verdict_name = verdict.get("verdict")
         if not isinstance(verdict_name, str) or verdict_name not in allowed_verdicts:
-            raise ProviderError(f"unknown verification verdict: {verdict_name}")
+            raise ModelOutputError(f"unknown verification verdict: {verdict_name}")
         if not isinstance(verdict.get("explanation"), str):
-            raise ProviderError("verification explanation is not text")
+            raise ModelOutputError("verification explanation is not text")
         quality = verdict.get("evidence_quality")
         if not isinstance(quality, str) or quality not in {
             "primary",
@@ -401,25 +437,25 @@ def validate_verification(
             "secondary",
             "unknown",
         }:
-            raise ProviderError(f"unknown verification evidence quality: {quality}")
+            raise ModelOutputError(f"unknown verification evidence quality: {quality}")
         if not isinstance(verdict.get("quality_explanation"), str):
-            raise ProviderError("verification quality_explanation is not text")
+            raise ModelOutputError("verification quality_explanation is not text")
         if isinstance(verdict.get("confidence"), bool):
-            raise ProviderError("verification confidence is not numeric")
+            raise ModelOutputError("verification confidence is not numeric")
         try:
             confidence = float(verdict.get("confidence"))
         except (TypeError, ValueError) as exc:
-            raise ProviderError("verification confidence is not numeric") from exc
+            raise ModelOutputError("verification confidence is not numeric") from exc
         if not 0 <= confidence <= 1:
-            raise ProviderError("verification confidence is outside 0..1")
+            raise ModelOutputError("verification confidence is outside 0..1")
         verdict["confidence"] = confidence
         supporting = verdict.get("supporting_source_ids")
         if not isinstance(supporting, list) or any(
             not isinstance(item, str) for item in supporting
         ):
-            raise ProviderError("verification supporting_source_ids must contain only strings")
+            raise ModelOutputError("verification supporting_source_ids must contain only strings")
         if any(item not in claim_sources[claim_id] for item in supporting):
-            raise ProviderError(f"verification cited a source not attached to claim {claim_id}")
+            raise ModelOutputError(f"verification cited a source not attached to claim {claim_id}")
         if not supporting:
             verdict["evidence_quality"] = "unknown"
             quality = "unknown"
@@ -427,7 +463,7 @@ def validate_verification(
         if not isinstance(missing_evidence, list) or any(
             not isinstance(item, str) for item in missing_evidence
         ):
-            raise ProviderError("verification missing_evidence must contain only strings")
+            raise ModelOutputError("verification missing_evidence must contain only strings")
         if verdict["verdict"] == "supported" and not supporting:
             verdict["verdict"] = "unsupported"
         elif verdict["verdict"] == "supported" and quality == "unknown":
@@ -440,7 +476,30 @@ def validate_verification(
             verdict["verdict"] = "unknown"
     if returned != claim_ids:
         absent = ", ".join(sorted(claim_ids - returned))
-        raise ProviderError(f"verification omitted claims: {absent}")
+        raise ModelOutputError(f"verification omitted claims: {absent}")
+    return value
+
+
+def validate_synthesis(value: dict[str, Any]) -> dict[str, Any]:
+    missing = [name for name in SYNTHESIS_SCHEMA["required"] if name not in value]
+    if missing:
+        raise ModelOutputError(f"synthesis response is missing fields: {', '.join(missing)}")
+    if not isinstance(value["synthesis_markdown"], str) or not value["synthesis_markdown"].strip():
+        raise ModelOutputError("synthesis response contains no synthesis_markdown")
+    if isinstance(value["confidence"], bool):
+        raise ModelOutputError("synthesis confidence is not numeric")
+    try:
+        confidence = float(value["confidence"])
+    except (TypeError, ValueError) as exc:
+        raise ModelOutputError("synthesis confidence is not numeric") from exc
+    if not 0 <= confidence <= 1:
+        raise ModelOutputError("synthesis confidence is outside 0..1")
+    value["confidence"] = confidence
+    for list_key in ("uncertainties", "open_questions"):
+        if not isinstance(value[list_key], list) or any(
+            not isinstance(item, str) for item in value[list_key]
+        ):
+            raise ModelOutputError(f"synthesis field {list_key} must contain only strings")
     return value
 
 
@@ -828,25 +887,108 @@ def ask_question(
     use_web = settings.get("web_search", True) if web is None else web
     effort = reasoning_effort or settings.get("reasoning_effort", "high")
     messages = build_research_messages(store, question, followups)
-    response = client.chat(
-        model=chosen_model,
-        messages=messages,
-        web=use_web,
-        reasoning_effort=effort,
-        response_schema=ANSWER_SCHEMA,
-        max_search_results=int(settings.get("max_search_results", 8)),
-    )
-    value = validate_answer(parse_json_content(response.content))
+    responses: list[ProviderResponse] = []
+    retry_errors: list[str] = []
+    value: dict[str, Any] | None = None
+    for attempt in range(1, MAX_OUTPUT_ATTEMPTS + 1):
+        response = client.chat(
+            model=chosen_model,
+            messages=messages,
+            web=use_web,
+            reasoning_effort=effort,
+            response_schema=ANSWER_SCHEMA,
+            max_search_results=int(settings.get("max_search_results", 8)),
+        )
+        responses.append(response)
+        try:
+            value = validate_answer(parse_json_content(response.content))
+            break
+        except ModelOutputError as exc:
+            retry_errors.append(str(exc))
+            if attempt == MAX_OUTPUT_ATTEMPTS:
+                run = _persist_failed_ask_attempt(
+                    store,
+                    question=question,
+                    model=chosen_model,
+                    messages=messages,
+                    responses=responses,
+                    error=str(exc),
+                )
+                raise ModelOutputError(
+                    f"model returned invalid output after {MAX_OUTPUT_ATTEMPTS} attempts; "
+                    f"preserved attempt as {run.id}: {exc}"
+                ) from exc
+    if value is None:  # pragma: no cover - the final failed attempt raises above
+        raise ModelOutputError("model produced no valid output")
+    raw: dict[str, Any] = {"prompts": messages, "parsed": value}
+    if len(responses) == 1:
+        raw["response"] = responses[0].raw
+    else:
+        raw["responses"] = [response.raw for response in responses]
+        raw["retry_errors"] = retry_errors
     return _persist_outcome(
         store,
         question=question,
         value=value,
-        responses=[response],
-        requested_models=[chosen_model],
+        responses=responses,
+        requested_models=[chosen_model] * len(responses),
         mode="ask",
-        raw={"prompts": messages, "response": response.raw, "parsed": value},
+        raw=raw,
         cursor=cursor,
     )
+
+
+def _persist_failed_ask_attempt(
+    store: GraphStore,
+    *,
+    question: Node,
+    model: str,
+    messages: list[dict[str, str]],
+    responses: list[ProviderResponse],
+    error: str,
+) -> ModelRun:
+    """Preserve paid calls when every ask attempt returned invalid output."""
+    run = ModelRun(
+        id=new_id("run"),
+        mode="ask",
+        question_id=question.id,
+        created_at=utc_now(),
+        provider="openrouter",
+        requested_models=[model] * len(responses),
+        resolved_models=[response.resolved_model for response in responses],
+        prompt_hash=prompt_hash(json.dumps(messages, sort_keys=True)),
+        usage={
+            "calls": [response.usage for response in responses],
+            "total_cost": sum(
+                response.usage.get("cost", 0)
+                for response in responses
+                if isinstance(response.usage.get("cost"), (int, float))
+            ),
+        },
+        raw={
+            "status": "failed_validation",
+            "prompts": messages,
+            "responses": [response.raw for response in responses],
+            "error": error,
+        },
+    )
+    with store.locked():
+        question = store.load_node(question.id)
+        question.run_ids = sorted(set(question.run_ids) | {run.id})
+        project = store.load_project()
+        with store.transaction(
+            [
+                store.run_path(run.id),
+                store.node_path(question.id),
+                store.project_path,
+                store.views_dir / "overview.md",
+            ]
+        ):
+            store.save_run(run)
+            store.update_node(question)
+            store.save_project(project)
+            write_overview(store)
+    return run
 
 
 def _parallel_calls(client: OpenRouterClient, calls: dict[str, dict[str, Any]]):
@@ -1354,6 +1496,155 @@ def record_manual_answer(
             store.save_project(project)
             write_overview(store, cursor=cursor)
     return answer
+
+
+def _descendant_question_ids(store: GraphStore, root_id: str) -> set[str]:
+    questions = [node for node in store.list_nodes() if node.type == "question"]
+    children: dict[str, list[str]] = defaultdict(list)
+    for question in questions:
+        if question.parent_id:
+            children[question.parent_id].append(question.id)
+    ids = {root_id}
+    stack = [root_id]
+    while stack:
+        current = stack.pop()
+        for child_id in children.get(current, []):
+            if child_id not in ids:
+                ids.add(child_id)
+                stack.append(child_id)
+    return ids
+
+
+def synthesize_answers(
+    store: GraphStore,
+    question_reference: str,
+    *,
+    client: OpenRouterClient,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    cursor: str = "default",
+) -> SynthesisOutcome:
+    question = store.load_node(store.resolve_node_id(question_reference, cursor=cursor))
+    if question.type != "question":
+        raise ValidationError(
+            f"synthesize expects a question node, got {question.type}: {question.id}"
+        )
+    question_ids = _descendant_question_ids(store, question.id)
+    answers = [
+        node
+        for node in store.list_nodes()
+        if node.type in {"answer", "synthesis"} and node.question_id in question_ids
+    ]
+    if not answers:
+        raise ValidationError(
+            f"no answers or syntheses found under {question.id}; run ask or council first"
+        )
+    answers.sort(key=lambda node: (node.created_at, node.id))
+    settings = store.load_project().settings
+    chosen_model = model or settings["default_model"]
+    effort = reasoning_effort or settings.get("reasoning_effort", "high")
+
+    packet = "\n\n".join(
+        f"## {node.id} ({node.type}) — {node.title}\n\n{node.body[:4000]}" for node in answers
+    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"""Synthesize the answers collected under this research question:
+
+{question.title}
+
+Answers:
+
+{packet}
+
+Reconcile agreement and disagreement, flag claims the captured evidence does not support, and
+list the questions that would resolve remaining uncertainty. {SYNTHESIS_CONTRACT}""",
+        },
+    ]
+    response = client.chat(
+        model=chosen_model,
+        messages=messages,
+        web=False,
+        reasoning_effort=effort,
+        response_schema=SYNTHESIS_SCHEMA,
+        max_tokens=8000,
+    )
+    value = validate_synthesis(parse_json_content(response.content))
+
+    created = utc_now()
+    run_id = new_id("run")
+    source_ids = sorted({source_id for node in answers for source_id in node.source_ids})
+    body = value["synthesis_markdown"].strip()
+    if value["uncertainties"]:
+        body += "\n\n## Uncertainties\n\n" + "\n".join(
+            f"- {item}" for item in value["uncertainties"]
+        )
+    if value["open_questions"]:
+        body += "\n\n## Open questions\n\n" + "\n".join(
+            f"- {item}" for item in value["open_questions"]
+        )
+    body += "\n"
+    node = Node(
+        id=new_id("synthesis"),
+        type="synthesis",
+        title=f"Synthesis: {question.title}",
+        status="answered" if value["confidence"] >= 0.65 else "uncertain",
+        created_at=created,
+        updated_at=created,
+        question_id=question.id,
+        edges=[Edge(type="related_to", target=item.id) for item in answers],
+        source_ids=source_ids,
+        run_ids=[run_id],
+        confidence=float(value["confidence"]),
+        tags=["synthesis", "unverified"],
+        body=body,
+    )
+    usage: dict[str, Any] = {"calls": [response.usage]}
+    if isinstance(response.usage.get("cost"), (int, float)):
+        usage["total_cost"] = response.usage["cost"]
+    run = ModelRun(
+        id=run_id,
+        mode="synthesize",
+        question_id=question.id,
+        created_at=created,
+        provider="openrouter",
+        requested_models=[chosen_model],
+        resolved_models=[response.resolved_model],
+        prompt_hash=prompt_hash(json.dumps(messages, sort_keys=True)),
+        response_node_ids=[node.id],
+        source_ids=source_ids,
+        usage=usage,
+        raw={
+            "prompts": messages,
+            "response": response.raw,
+            "parsed": value,
+            "aggregated": [item.id for item in answers],
+        },
+    )
+    with store.locked():
+        question = store.load_node(question.id)
+        question.run_ids = sorted(set(question.run_ids) | {run_id})
+        question.source_ids = sorted(set(question.source_ids) | set(source_ids))
+        project = store.load_project()
+        with store.transaction(
+            [
+                store.node_path(node.id),
+                store.node_path(question.id),
+                store.run_path(run.id),
+                store.cursor_path(cursor),
+                store.project_path,
+                store.views_dir / "overview.md",
+            ]
+        ):
+            store.save_node(node)
+            store.update_node(question)
+            store.save_run(run)
+            store.set_focus(question.id, cursor=cursor)
+            store.save_project(project)
+            write_overview(store, cursor=cursor)
+    return SynthesisOutcome(node=node, run=run, aggregated=[item.id for item in answers])
 
 
 def _aggregate_claim_status(claims: list[Node]) -> str:

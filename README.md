@@ -91,7 +91,8 @@ The council idea is inspired by [Andrej Karpathy's LLM Council](https://github.c
 research-tree --root ./research where
 research-tree --root ./research focus q_abc123
 research-tree --root ./research tree --depth 3
-research-tree --root ./research next --from focus --limit 5
+research-tree --root ./research next --limit 5
+research-tree --root ./research next --from focus --limit 5   # scope to one subtree
 research-tree --root ./research show q_abc123
 research-tree --root ./research graph --format mermaid
 research-tree --root ./research graph --format dot --output map.dot
@@ -108,7 +109,8 @@ research-tree --root ./research --cursor pi-session-42 where
 ```
 
 Every command supports `--json` for agents and scripts. Expected failures use stable exit codes:
-`3` not found, `4` provider/configuration, and `5` validation/integrity.
+`3` not found, `4` provider/configuration, and `5` validation/integrity (including model output
+that fails to parse or validate).
 
 ## Writing workflow
 
@@ -116,6 +118,13 @@ Promote a useful answer or synthesis into an article's research notes:
 
 ```bash
 research-tree --root ./research promote y_abc123 --to ../research.md
+```
+
+To turn a whole subtree of answered questions into a single synthesis without the cost of a
+council, run `synthesize` (one model call, no web search):
+
+```bash
+research-tree --root ./research synthesize root
 ```
 
 Model-generated answers must be verified and non-contested before promotion. Deliberate escape
@@ -135,7 +144,7 @@ research/
 │   ├── a_….md                answers and council perspectives
 │   ├── c_….md                atomic claims
 │   ├── k_….md                concepts
-│   └── y_….md                council syntheses
+│   ├── y_….md                syntheses (council or synthesize)
 ├── sources/s_….json          immutable URL + retrieved excerpt snapshots
 ├── runs/r_….json             immutable prompts, outputs, models, usage, cost
 ├── views/overview.md         generated human-readable map
@@ -156,6 +165,7 @@ binary database. See [the format contract](docs/format.md) for entity and relati
 | `ask` | Run one evidence-aware model |
 | `council` | Compare models through blind review and synthesis |
 | `verify` | Check claim-level citation support against frozen excerpts |
+| `synthesize` | Merge answered questions into one `y_` synthesis node |
 | `tree` / `next` | See the inquiry hierarchy and research frontier |
 | `show` | Inspect a node with provenance |
 | `graph` | Export Mermaid, DOT, or JSON |

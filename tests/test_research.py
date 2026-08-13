@@ -8,18 +8,21 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from research_tree.doctor import inspect_graph
-from research_tree.errors import ProviderError
+from research_tree.errors import ModelOutputError, ProviderError, ValidationError
 from research_tree.providers import ProviderResponse
 from research_tree.research import (
     ANSWER_SCHEMA,
     COUNCIL_SCHEMA,
     REVIEW_SCHEMA,
+    SYNTHESIS_SCHEMA,
     VERIFY_SCHEMA,
     ask_question,
     parse_json_content,
     record_manual_answer,
     run_council,
+    synthesize_answers,
     validate_answer,
+    validate_synthesis,
     validate_verification,
     verify_claims,
 )
@@ -200,6 +203,34 @@ class MalformedSingleClient:
         return provider_response(kwargs["model"], value)
 
 
+class FlakyThenValidClient:
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            value = answer_payload()
+            value["confidence"] = "not-a-number"
+            return provider_response(kwargs["model"], value)
+        return provider_response(kwargs["model"], answer_payload())
+
+
+class FakeSynthesizeClient:
+    def chat(self, **kwargs):
+        assert kwargs["response_schema"] == SYNTHESIS_SCHEMA
+        assert kwargs["web"] is False
+        return provider_response(
+            kwargs["model"],
+            {
+                "synthesis_markdown": "A merged synthesis of the collected answers.",
+                "confidence": 0.85,
+                "uncertainties": ["One open question remains."],
+                "open_questions": ["What is the next step?"],
+            },
+        )
+
+
 class DistinctCouncilSourcesClient(FakeCouncilClient):
     def chat(self, **kwargs):
         response = super().chat(**kwargs)
@@ -275,12 +306,33 @@ def test_duplicate_followup_is_not_added_twice(store):
     assert store.load_node("root").status == "answered"
 
 
-def test_malformed_nested_answer_is_rejected_before_any_persistence(store):
-    with pytest.raises(ProviderError, match="follow-up"):
+def test_malformed_answer_is_retried_then_persisted_as_failed_run(store):
+    with pytest.raises(ModelOutputError, match="follow-up"):
         ask_question(store, "root", client=MalformedSingleClient(), model="model/malformed")
     assert len(store.list_nodes()) == 1
     assert list(store.sources_dir.glob("*.json")) == []
-    assert list(store.runs_dir.glob("*.json")) == []
+    runs = list(store.runs_dir.glob("*.json"))
+    assert len(runs) == 1
+    run = store.load_run(runs[0].stem)
+    assert run.raw["status"] == "failed_validation"
+    assert len(run.usage["calls"]) == 2
+    assert run.id in store.load_node("root").run_ids
+    assert inspect_graph(store).healthy
+
+
+def test_ask_retries_once_and_keeps_both_attempts_usage(store):
+    outcome = ask_question(
+        store,
+        "root",
+        client=FlakyThenValidClient(),
+        model="test/model",
+    )
+    assert outcome.answer.type == "answer"
+    assert outcome.run.resolved_models == ["test/model-resolved", "test/model-resolved"]
+    assert len(outcome.run.usage["calls"]) == 2
+    assert outcome.run.usage["total_cost"] == pytest.approx(0.02)
+    assert "retry_errors" in outcome.run.raw
+    assert inspect_graph(store).healthy
 
 
 def test_io_failure_rolls_back_the_whole_research_outcome(store, monkeypatch):
@@ -330,6 +382,39 @@ def test_manual_answer_updates_question_without_model_run(store):
     assert answer.tags == ["manual"]
     assert store.load_node("root").status == "answered"
     assert list(store.runs_dir.glob("*.json")) == []
+
+
+def test_synthesize_merges_subtree_answers_into_a_synthesis_node(store):
+    root_answer = ask_question(store, "root", client=FakeSingleClient(), model="test/model")
+    child = store.add_question("A child question", parent="root", focus=False)
+    child_answer = ask_question(store, child.id, client=FakeSingleClient(), model="test/model")
+    outcome = synthesize_answers(store, "root", client=FakeSynthesizeClient())
+    assert outcome.node.type == "synthesis"
+    assert outcome.node.question_id == store.load_project().root_question_id
+    assert set(outcome.aggregated) == {root_answer.answer.id, child_answer.answer.id}
+    assert outcome.run.mode == "synthesize"
+    assert outcome.run.id in store.load_node("root").run_ids
+    assert set(outcome.node.source_ids) == set(root_answer.answer.source_ids) | set(
+        child_answer.answer.source_ids
+    )
+    assert inspect_graph(store).healthy
+
+
+def test_synthesize_requires_existing_answers(store):
+    with pytest.raises(ValidationError, match="no answers"):
+        synthesize_answers(store, "root", client=FakeSynthesizeClient())
+
+
+def test_validate_synthesis_rejects_boolean_confidence():
+    with pytest.raises(ModelOutputError, match="not numeric"):
+        validate_synthesis(
+            {
+                "synthesis_markdown": "A synthesis.",
+                "confidence": True,
+                "uncertainties": [],
+                "open_questions": [],
+            }
+        )
 
 
 def test_council_persists_individual_views_reviews_and_synthesis(store):
