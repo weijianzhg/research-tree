@@ -115,6 +115,35 @@ def _inspect_graph_locked(store: GraphStore) -> DoctorReport:
         for source_id in run.source_ids:
             if source_id not in source_ids:
                 report.errors.append(f"run {run_id} references missing source {source_id}")
+        if run.mode == "search":
+            ranked = run.raw.get("ranked_results")
+            if not isinstance(ranked, list):
+                report.errors.append(f"search run {run_id} has no ranked_results manifest")
+                continue
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("rank"), int)
+                or isinstance(item.get("rank"), bool)
+                or (
+                    item.get("source_id") is not None and not isinstance(item.get("source_id"), str)
+                )
+                for item in ranked
+            ):
+                report.errors.append(f"search run {run_id} has malformed ranked results")
+                continue
+            expected_ranks = list(range(1, len(ranked) + 1))
+            actual_ranks = [item["rank"] for item in ranked]
+            if actual_ranks != expected_ranks:
+                report.errors.append(f"search run {run_id} has invalid result ranking")
+            manifest_source_ids = {
+                item.get("source_id")
+                for item in ranked
+                if isinstance(item, dict) and item.get("source_id") is not None
+            }
+            if manifest_source_ids != set(run.source_ids):
+                report.errors.append(
+                    f"search run {run_id} ranked source links do not match source_ids"
+                )
 
     if not (store.root / ".gitignore").exists():
         report.warnings.append(".gitignore is missing; local cursor state may be committed")

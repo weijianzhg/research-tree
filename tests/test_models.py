@@ -3,7 +3,16 @@ from __future__ import annotations
 import pytest
 
 from research_tree.errors import ValidationError
-from research_tree.models import Edge, Node, content_hash, new_id, stable_source_id, utc_now
+from research_tree.models import (
+    Edge,
+    ModelRun,
+    Node,
+    Source,
+    content_hash,
+    new_id,
+    stable_source_id,
+    utc_now,
+)
 
 
 def test_ids_have_type_prefix_and_validate_through_node():
@@ -65,3 +74,40 @@ def test_source_id_is_snapshot_deterministic():
         "https://example.com", "v2"
     )
     assert len(content_hash("hello")) == 64
+
+
+def test_source_rejects_http_url_without_a_host():
+    source = Source(
+        id=stable_source_id("https://", ""),
+        url="https://",
+        title="Invalid",
+        retrieved_at=utc_now(),
+        content_hash=content_hash(""),
+    )
+    with pytest.raises(ValidationError, match="not valid"):
+        source.validate()
+
+
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        {"requested_models": ["model"], "resolved_models": ["model"]},
+        {"response_node_ids": ["a_111111111111"]},
+    ],
+)
+def test_search_run_rejects_chat_models_and_response_nodes(bad_fields):
+    arguments = dict(
+        id=new_id("run"),
+        mode="search",
+        question_id=new_id("question"),
+        created_at=utc_now(),
+        provider="perplexity",
+        requested_models=[],
+        resolved_models=[],
+        prompt_hash="0" * 64,
+        raw={"ranked_results": []},
+    )
+    arguments.update(bad_fields)
+    run = ModelRun(**arguments)
+    with pytest.raises(ValidationError, match="cannot contain models or response nodes"):
+        run.validate()

@@ -188,6 +188,7 @@ def test_project_json_is_valid_and_versioned(store):
     data = json.loads((store.root / "project.json").read_text())
     assert data["schema_version"] == 1
     assert data["settings"]["web_search"] is True
+    assert data["settings"]["search_provider"] == "openrouter"
 
 
 def test_transaction_rolls_back_partial_writes(store):

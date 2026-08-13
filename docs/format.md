@@ -66,7 +66,7 @@ to a fully supported verdict by deterministic validation.
 
 A run stores:
 
-- mode (`ask`, `council`, or `verify`)
+- mode (`search`, `ask`, `council`, or `verify`)
 - question ID
 - requested and resolved model IDs
 - prompt hash and full prompts
@@ -74,6 +74,12 @@ A run stores:
 - response node and source IDs
 - tokens and provider-reported cost
 - timestamp and schema version
+
+A `search` run has empty requested/resolved model lists and no response node. Its raw payload keeps
+the exact provider request, ranked result manifest, request ID, server time, and untouched response.
+Its `source_ids` point to the HTTP(S) excerpts materialized from those results. Non-HTTP results are
+retained in raw provenance but cannot become canonical Sources. When an `ask` or `council` consumes
+a prior search, semantic nodes link both run IDs and the model run records the retrieval run ID.
 
 Runs are immutable. A later re-evaluation creates another run and another answer; it never overwrites
 the historical result.

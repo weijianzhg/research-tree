@@ -88,6 +88,22 @@ class TwoClaimClient:
         return provider_response(kwargs["model"], payload)
 
 
+class MultipleSnapshotsClient(FakeSingleClient):
+    def chat(self, **kwargs):
+        response = super().chat(**kwargs)
+        response.annotations.append(
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "url": "https://example.com/paper",
+                    "title": "Primary MoE paper, alternate excerpt",
+                    "content": "A second provider excerpt for the same URL.",
+                },
+            }
+        )
+        return response
+
+
 class FakeCouncilClient:
     def __init__(self):
         self.lock = threading.Lock()
@@ -268,6 +284,19 @@ def test_ask_persists_answer_claim_source_run_and_followup(store):
     assert inspect_graph(store).healthy
 
 
+def test_openrouter_keeps_distinct_snapshots_for_the_same_url(store):
+    outcome = ask_question(
+        store,
+        "root",
+        client=MultipleSnapshotsClient(),
+        model="test/model",
+    )
+    snapshots = [source for source in outcome.sources if source.url == "https://example.com/paper"]
+    assert len(snapshots) == 2
+    assert len(outcome.run.source_ids) == 2
+    assert set(outcome.answer.source_ids) == {source.id for source in snapshots}
+
+
 def test_duplicate_followup_is_not_added_twice(store):
     ask_question(store, "root", client=FakeSingleClient(), model="test/model")
     second = ask_question(store, "root", client=FakeSingleClient(), model="test/model")
@@ -275,12 +304,16 @@ def test_duplicate_followup_is_not_added_twice(store):
     assert store.load_node("root").status == "answered"
 
 
-def test_malformed_nested_answer_is_rejected_before_any_persistence(store):
-    with pytest.raises(ProviderError, match="follow-up"):
+def test_malformed_nested_answer_preserves_paid_attempt_without_semantic_nodes(store):
+    with pytest.raises(ProviderError, match="preserved attempt as.*follow-up"):
         ask_question(store, "root", client=MalformedSingleClient(), model="model/malformed")
     assert len(store.list_nodes()) == 1
-    assert list(store.sources_dir.glob("*.json")) == []
-    assert list(store.runs_dir.glob("*.json")) == []
+    runs = [store.load_run(path.stem) for path in store.runs_dir.glob("*.json")]
+    assert len(runs) == 1
+    assert runs[0].raw["status"] == "failed_validation"
+    assert runs[0].usage["total_cost"] == pytest.approx(0.01)
+    assert store.load_node("root").run_ids == [runs[0].id]
+    assert inspect_graph(store).healthy
 
 
 def test_io_failure_rolls_back_the_whole_research_outcome(store, monkeypatch):

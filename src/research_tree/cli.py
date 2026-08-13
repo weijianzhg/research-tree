@@ -18,9 +18,10 @@ from .errors import (
     NotFoundError,
     ProviderError,
     ResearchTreeError,
+    ValidationError,
 )
 from .models import Source, content_hash, stable_source_id, utc_now
-from .providers import OpenRouterClient
+from .providers import OpenRouterClient, PerplexitySearchClient, SearchOptions
 from .render import (
     frontier,
     graph_data,
@@ -30,7 +31,14 @@ from .render import (
     render_where,
     write_overview,
 )
-from .research import ask_question, record_manual_answer, run_council, verify_claims
+from .research import (
+    ask_question,
+    record_manual_answer,
+    resolve_search_provider,
+    run_council,
+    search_question,
+    verify_claims,
+)
 from .store import GraphStore, _atomic_write, load_store
 
 EXIT_NOT_FOUND = 3
@@ -62,6 +70,23 @@ def _verification_json(outcome) -> dict[str, Any]:
     }
 
 
+def _retrieval_cost(store: GraphStore, outcome) -> float | None:
+    retrieval = outcome.run.raw.get("retrieval")
+    if not isinstance(retrieval, dict) or not isinstance(retrieval.get("run_id"), str):
+        return None
+    value = store.load_run(retrieval["run_id"]).usage.get("estimated_cost_usd")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _search_json(outcome) -> dict[str, Any]:
+    return {
+        "query": outcome.query,
+        "run": outcome.run.to_dict(),
+        "sources": [source.to_dict() for source in outcome.sources],
+        "ranked_results": outcome.run.raw["ranked_results"],
+    }
+
+
 def emit(data: Any, *, as_json: bool, human: str | None = None) -> None:
     if as_json:
         print(json.dumps({"ok": True, "data": data}, indent=2, ensure_ascii=False, sort_keys=True))
@@ -75,6 +100,45 @@ def emit(data: Any, *, as_json: bool, human: str | None = None) -> None:
 
 def _store(args) -> GraphStore:
     return load_store(args.root)
+
+
+def _search_options(args, settings: dict[str, Any]) -> SearchOptions:
+    return SearchOptions(
+        max_results=args.max_results or int(settings.get("max_search_results", 8)),
+        context_size=getattr(args, "context_size", None) or "high",
+        country=getattr(args, "country", None),
+        languages=tuple(getattr(args, "languages", None) or ()),
+        domains=tuple(getattr(args, "domains", None) or ()),
+        recency=getattr(args, "recency", None),
+        published_after=getattr(args, "published_after", None),
+        published_before=getattr(args, "published_before", None),
+        updated_after=getattr(args, "updated_after", None),
+        updated_before=getattr(args, "updated_before", None),
+    )
+
+
+def _search_setup(args, settings: dict[str, Any]):
+    selected = resolve_search_provider(settings, web=args.web, search_provider=args.search_provider)
+    has_perplexity_filters = any(
+        getattr(args, name, None)
+        for name in (
+            "context_size",
+            "country",
+            "languages",
+            "domains",
+            "recency",
+            "published_after",
+            "published_before",
+            "updated_after",
+            "updated_before",
+        )
+    )
+    if has_perplexity_filters and selected not in {"perplexity", "both"}:
+        raise ValidationError("search filters require Perplexity or both as the search provider")
+    if args.max_results is not None and selected == "none":
+        raise ValidationError("--max-results requires an enabled search provider")
+    retriever = PerplexitySearchClient() if selected in {"perplexity", "both"} else None
+    return selected, retriever, _search_options(args, settings)
 
 
 def cmd_init(args):
@@ -181,24 +245,52 @@ def cmd_answer(args):
     emit(_node_json(node), as_json=args.json, human=f"Saved {node.id} — {node.title}")
 
 
+def cmd_search(args):
+    store = _store(args)
+    settings = store.load_project().settings
+    if args.provider != "perplexity":
+        raise ValidationError(f"unsupported retrieval provider: {args.provider}")
+    if not args.json:
+        print("Searching the live web with Perplexity...", file=sys.stderr)
+    outcome = search_question(
+        store,
+        args.node,
+        client=PerplexitySearchClient(),
+        query=args.query,
+        options=_search_options(args, settings),
+        cursor=args.cursor,
+    )
+    lines = [f"Search run {outcome.run.id}: {outcome.query}"]
+    for item in outcome.run.raw["ranked_results"]:
+        stored = "" if item["source_id"] else " [not materialized: non-HTTP URL]"
+        lines.extend([f"{item['rank']}. {item['title']}{stored}", f"   {item['url']}"])
+    if not outcome.run.raw["ranked_results"]:
+        lines.append("No results were returned.")
+    if outcome.run.usage.get("estimated_cost_usd") is not None:
+        lines.append(f"Estimated search cost: ${outcome.run.usage['estimated_cost_usd']:.4f}")
+    emit(_search_json(outcome), as_json=args.json, human="\n".join(lines))
+
+
 def cmd_ask(args):
     store = _store(args)
     question_id = store.resolve_node_id(args.node, cursor=args.cursor)
     settings = store.load_project().settings
     chosen = args.model or settings["default_model"]
-    use_web = settings.get("web_search", True) if args.web is None else args.web
+    selected_search, retriever, search_options = _search_setup(args, settings)
     if not args.json:
         print(
             f"Researching {question_id} with {chosen}"
-            + (" + web evidence..." if use_web else "..."),
+            + (f" + {selected_search} search..." if selected_search != "none" else "..."),
             file=sys.stderr,
         )
     outcome = ask_question(
         store,
         question_id,
         client=OpenRouterClient(),
+        retriever=retriever,
         model=args.model,
-        web=args.web,
+        search_provider=selected_search,
+        search_options=search_options,
         reasoning_effort=args.effort,
         followups=args.followups,
         cursor=args.cursor,
@@ -210,12 +302,17 @@ def cmd_ask(args):
         )
     if outcome.run.usage.get("total_cost") is not None:
         human += f"\n\nRecorded cost: ${outcome.run.usage['total_cost']:.4f}"
+    retrieval_cost = _retrieval_cost(store, outcome)
+    if retrieval_cost is not None:
+        human += f"\nEstimated retrieval cost: ${retrieval_cost:.4f}"
     emit(_outcome_json(outcome), as_json=args.json, human=human)
 
 
 def cmd_council(args):
     store = _store(args)
-    models = args.models or store.load_project().settings["council_models"]
+    settings = store.load_project().settings
+    models = args.models or settings["council_models"]
+    selected_search, retriever, search_options = _search_setup(args, settings)
     if not args.json:
         print(
             f"Running evidence council: {len(models)} first opinions, "
@@ -226,9 +323,11 @@ def cmd_council(args):
         store,
         args.node,
         client=OpenRouterClient(),
+        retriever=retriever,
         models=args.models,
         chairman_model=args.chairman,
-        web=args.web,
+        search_provider=selected_search,
+        search_options=search_options,
         reasoning_effort=args.effort,
         followups=args.followups,
         cursor=args.cursor,
@@ -243,6 +342,9 @@ def cmd_council(args):
         )
     if outcome.run.usage.get("total_cost") is not None:
         human += f"\n\nRecorded cost: ${outcome.run.usage['total_cost']:.4f}"
+    retrieval_cost = _retrieval_cost(store, outcome)
+    if retrieval_cost is not None:
+        human += f"\nEstimated retrieval cost: ${retrieval_cost:.4f}"
     emit(_outcome_json(outcome), as_json=args.json, human=human)
 
 
@@ -447,6 +549,9 @@ def cmd_config(args):
         if args.web is not None:
             project.settings["web_search"] = args.web
             changed = True
+        if args.search_provider:
+            project.settings["search_provider"] = args.search_provider
+            changed = True
         if changed:
             store.save_project(project)
     emit(
@@ -514,6 +619,23 @@ def cmd_run_show(args):
     )
 
 
+def _add_retrieval_filters(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--max-results", type=int, choices=range(1, 21))
+    command.add_argument("--context-size", choices=["low", "medium", "high"])
+    command.add_argument("--country", help="two-letter ISO country code")
+    command.add_argument(
+        "--language", dest="languages", action="append", help="two-letter language (repeat)"
+    )
+    command.add_argument(
+        "--domain", dest="domains", action="append", help="domain allow/deny filter (repeat)"
+    )
+    command.add_argument("--recency", choices=["hour", "day", "week", "month", "year"])
+    command.add_argument("--published-after", metavar="MM/DD/YYYY")
+    command.add_argument("--published-before", metavar="MM/DD/YYYY")
+    command.add_argument("--updated-after", metavar="MM/DD/YYYY")
+    command.add_argument("--updated-before", metavar="MM/DD/YYYY")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research-tree",
@@ -555,6 +677,13 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--file")
     command.set_defaults(func=cmd_answer)
 
+    command = sub.add_parser("search", help="capture ranked real-time web results")
+    command.add_argument("node", nargs="?", default="focus")
+    command.add_argument("--query", help="override the question text used as the query")
+    command.add_argument("--provider", choices=["perplexity"], default="perplexity")
+    _add_retrieval_filters(command)
+    command.set_defaults(func=cmd_search)
+
     command = sub.add_parser("ask", help="research a question with one model")
     command.add_argument("node", nargs="?", default="focus")
     command.add_argument("--model")
@@ -563,6 +692,8 @@ def build_parser() -> argparse.ArgumentParser:
     web_group.add_argument("--web", dest="web", action="store_true")
     web_group.add_argument("--no-web", dest="web", action="store_false")
     command.set_defaults(web=None)
+    command.add_argument("--search-provider", choices=["openrouter", "perplexity", "both", "none"])
+    _add_retrieval_filters(command)
     command.add_argument("--followups", type=int, default=4)
     command.set_defaults(func=cmd_ask)
 
@@ -577,6 +708,8 @@ def build_parser() -> argparse.ArgumentParser:
     web_group.add_argument("--web", dest="web", action="store_true")
     web_group.add_argument("--no-web", dest="web", action="store_false")
     command.set_defaults(web=None)
+    command.add_argument("--search-provider", choices=["openrouter", "perplexity", "both", "none"])
+    _add_retrieval_filters(command)
     command.add_argument("--followups", type=int, default=5)
     command.set_defaults(func=cmd_council)
 
@@ -629,6 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--council-model", action="append")
     command.add_argument("--effort", choices=["minimal", "low", "medium", "high", "xhigh", "max"])
     command.add_argument("--max-search-results", type=int, choices=range(1, 21))
+    command.add_argument("--search-provider", choices=["openrouter", "perplexity", "both", "none"])
     web_group = command.add_mutually_exclusive_group()
     web_group.add_argument("--web", dest="web", action="store_true")
     web_group.add_argument("--no-web", dest="web", action="store_false")

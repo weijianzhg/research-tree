@@ -9,6 +9,7 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from .errors import ValidationError
 
@@ -33,7 +34,7 @@ EDGE_TYPES = {
     "derived_from",
     "supersedes",
 }
-RUN_MODES = {"ask", "council", "verify"}
+RUN_MODES = {"ask", "council", "search", "verify"}
 ID_RE = re.compile(r"^(p|q|a|c|k|y|n|s|r)_[a-f0-9]{12}$")
 
 PREFIXES = {
@@ -245,6 +246,10 @@ class Source:
         validate_id(self.id, prefixes={"s"})
         if not self.url.startswith(("http://", "https://", "file:")):
             raise ValidationError(f"source URL is not supported: {self.url}")
+        if self.url.startswith(("http://", "https://")):
+            parsed = urlparse(self.url)
+            if not parsed.hostname or any(character.isspace() for character in self.url):
+                raise ValidationError(f"source URL is not valid: {self.url}")
         if self.schema_version != SCHEMA_VERSION:
             raise ValidationError(f"source {self.id} uses an unsupported schema")
         if self.content_hash != content_hash(self.excerpt):
@@ -295,6 +300,31 @@ class ModelRun:
             raise ValidationError(
                 f"run {self.id} requested/resolved model lists have different lengths"
             )
+        if self.mode == "search" and (
+            self.requested_models or self.resolved_models or self.response_node_ids
+        ):
+            raise ValidationError(f"search run {self.id} cannot contain models or response nodes")
+        if self.mode == "search":
+            if not isinstance(self.raw, dict):
+                raise ValidationError(f"search run {self.id} raw provenance is not an object")
+            ranked = self.raw.get("ranked_results")
+            if not isinstance(ranked, list) or any(
+                not isinstance(item, dict)
+                or item.get("rank") != index
+                or isinstance(item.get("rank"), bool)
+                or (
+                    item.get("source_id") is not None and not isinstance(item.get("source_id"), str)
+                )
+                for index, item in enumerate(ranked or [], 1)
+            ):
+                raise ValidationError(f"search run {self.id} has invalid result ranking")
+            ranked_source_ids = {
+                item["source_id"] for item in ranked if item.get("source_id") is not None
+            }
+            if ranked_source_ids != set(self.source_ids):
+                raise ValidationError(
+                    f"search run {self.id} ranked source links do not match source_ids"
+                )
         for node_id in self.response_node_ids:
             validate_id(node_id)
         for source_id in self.source_ids:

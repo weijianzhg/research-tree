@@ -34,15 +34,17 @@ uv tool install --editable /path/to/research-tree
 # or: pipx install --editable /path/to/research-tree
 ```
 
-Research calls use OpenRouter. Credentials are resolved without copying them into a project, in
-this order:
+Model calls use OpenRouter. Credentials are resolved without copying them into a project, in this
+order:
 
 1. `OPENROUTER_API_KEY`
 2. `~/.config/research-tree/config.json`
 3. the active OpenRouter login already held by Pi
 4. an existing `~/.fluff-cutter/config.yaml`
 
-All graph-management commands work offline.
+Direct real-time retrieval through Perplexity is optional. Set `PERPLEXITY_API_KEY`, or add
+`perplexity_api_key` to `~/.config/research-tree/config.json`. The key is never written into a
+research graph. All graph-management commands continue to work offline.
 
 ## First research session
 
@@ -56,18 +58,39 @@ research-tree --root ./research branch \
 
 research-tree --root ./research where
 research-tree --root ./research tree
+research-tree --root ./research search focus --provider perplexity --recency month
 research-tree --root ./research ask focus
 research-tree --root ./research verify a_abc123 --model '~anthropic/claude-sonnet-latest'
 research-tree --root ./research next --from root
 ```
 
-`ask` uses high reasoning and model-controlled web search by default. It stores the answer, atomic
-claims, citation snapshots, uncertainties, suggested branches, usage/cost data, and the raw provider
-response. Use `--no-web`, `--effort`, or `--model` to override a run. `verify` then freezes the
-captured excerpts and asks a verifier—ideally a different model—whether each excerpt actually
-entails its claim. It records source authority separately, so an aggregator repeating a number is
-not mistaken for a primary benchmark artifact. Verification can mark claims supported, partial,
-unsupported, contradicted, or unknown without rewriting the original answer.
+`ask` uses high reasoning and OpenRouter's model-controlled web search by default. It stores the
+answer, atomic claims, citation snapshots, uncertainties, suggested branches, usage/cost data, and
+the raw provider response. Use `--no-web`, `--effort`, or `--model` to override a run.
+
+Perplexity's direct Search API provides a second retrieval mode:
+
+```bash
+# Capture ranked results without asking a model.
+research-tree --root ./research search focus --recency week --domain huggingface.co
+
+# Give one frozen result set to the answer model; OpenRouter does not search again.
+research-tree --root ./research ask focus --search-provider perplexity
+
+# Supply the shared Perplexity baseline and still let the model search independently.
+research-tree --root ./research ask focus --search-provider both
+```
+
+Each Perplexity search is its own immutable run. Research Tree records the exact query and filters,
+result order, request ID, raw response, local source snapshots, and a date-stamped cost estimate.
+Snippets are discovery excerpts rather than full-document proof, so prompts explicitly tell models
+to distinguish what the excerpt supports from what still requires a primary source. Search can be
+narrowed by country, language, domain, recency, or publication/update dates.
+
+`verify` asks a verifier—ideally a different model—whether each frozen excerpt actually entails its
+claim. It records source authority separately, so an aggregator repeating a number is not mistaken
+for a primary benchmark artifact. Verification can mark claims supported, partial, unsupported,
+contradicted, or unknown without rewriting the original answer.
 
 For questions where disagreement matters:
 
@@ -78,10 +101,13 @@ research-tree --root ./research council focus \
   --model '~google/gemini-pro-latest'
 ```
 
-Council mode runs independent evidence searches, anonymized peer reviews, and a chairman synthesis.
-It preserves each model's answer and the minority views; consensus is recorded as a signal, not
-treated as truth. A three-model council makes seven paid completions (three answers, three reviews,
-one synthesis), so it is intentionally explicit rather than automatic.
+Council mode runs independent answers, anonymized peer reviews, and a chairman synthesis. With the
+default OpenRouter search, each member can investigate independently. With
+`--search-provider perplexity`, one frozen result set becomes a shared baseline for every member,
+reviewer, and chairman; `both` combines that baseline with independent model-controlled searches.
+The council preserves each model's answer and minority views; consensus is recorded as a signal,
+not treated as truth. A three-model council makes seven paid completions (three answers, three
+reviews, one synthesis), so it is intentionally explicit rather than automatic.
 
 ## Navigation
 
@@ -160,6 +186,7 @@ binary database. See [the format contract](docs/format.md) for entity and relati
 | `where` / `focus` | Inspect or change a named cursor |
 | `branch` | Add an explicit child question |
 | `answer` | Record a human/manual answer |
+| `search` | Capture ranked real-time results and source snapshots |
 | `ask` | Run one evidence-aware model |
 | `council` | Compare models through blind review and synthesis |
 | `verify` | Check claim-level citation support against frozen excerpts |
@@ -175,7 +202,9 @@ binary database. See [the format contract](docs/format.md) for entity and relati
 The council protocol borrows the pattern—not code—from [Andrej Karpathy's LLM
 Council](https://github.com/karpathy/llm-council), then changes the judging target from polished prose
 to claim support and source quality. The branching, human-steerable research experience is closest
-to [Co-STORM](https://github.com/stanford-oval/storm). OpenRouter's
+to [Co-STORM](https://github.com/stanford-oval/storm). Perplexity's
+[Search API](https://docs.perplexity.ai/api-reference/search-post) supplies ranked, filterable
+real-time results, while OpenRouter's
 [web-search server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search) supplies
 model-controlled current evidence through a common API.
 
@@ -188,4 +217,4 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-The project is experimental (`0.1.x`). The on-disk format is versioned and validated before use.
+The project is experimental (`0.2.x`). The on-disk format is versioned and validated before use.

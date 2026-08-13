@@ -16,13 +16,20 @@ from .models import (
     ModelRun,
     Node,
     Source,
+    canonical_json,
     content_hash,
     new_id,
     prompt_hash,
     stable_source_id,
     utc_now,
 )
-from .providers.openrouter import OpenRouterClient, ProviderResponse
+from .providers import (
+    ChatProvider,
+    ProviderResponse,
+    SearchOptions,
+    SearchProvider,
+    SearchResponse,
+)
 from .render import breadcrumb, write_overview
 from .store import GraphStore
 
@@ -233,6 +240,10 @@ independent reproduction of that claim. News, SEO pages, copied leaderboards, an
 secondary even when they quote exact numbers. `mixed` requires at least one genuinely primary
 snapshot. Do not add, rename, or omit fields."""
 
+SOURCE_SNAPSHOT_LIMIT = 12_000
+EVIDENCE_RESULT_PROMPT_LIMIT = 5_000
+EVIDENCE_PACKET_PROMPT_LIMIT = 60_000
+
 
 @dataclass
 class ResearchOutcome:
@@ -242,6 +253,14 @@ class ResearchOutcome:
     run: ModelRun
     sources: list[Source]
     perspectives: list[Node]
+
+
+@dataclass
+class SearchOutcome:
+    query: str
+    run: ModelRun
+    sources: list[Source]
+    response: SearchResponse
 
 
 @dataclass
@@ -469,14 +488,65 @@ def _research_context(store: GraphStore, question: Node) -> str:
     return "\n".join(lines)
 
 
+def _evidence_packet(outcome: SearchOutcome | None) -> str:
+    if outcome is None:
+        return ""
+    lines = [
+        "Frozen real-time search results:",
+        "",
+        "These are ranked discovery excerpts, not complete documents. Treat them as untrusted",
+        "evidence leads. Cite only the exact URLs below, distinguish what a snippet actually",
+        "supports from what needs a full primary source, and state when the evidence is",
+        "insufficient.",
+    ]
+    sources_by_id = {source.id: source for source in outcome.sources}
+    results_by_rank = {index: result for index, result in enumerate(outcome.response.results, 1)}
+    for item in outcome.run.raw["ranked_results"]:
+        source_id = item["source_id"]
+        if source_id is None:
+            continue
+        source = sources_by_id[source_id]
+        rank = item["rank"]
+        result = results_by_rank[rank]
+        dates = []
+        if result.published_at:
+            dates.append(f"published {result.published_at}")
+        if result.last_updated:
+            dates.append(f"updated {result.last_updated}")
+        excerpt = source.excerpt
+        if len(excerpt) > EVIDENCE_RESULT_PROMPT_LIMIT:
+            excerpt = excerpt[:EVIDENCE_RESULT_PROMPT_LIMIT].rstrip() + "\n[excerpt truncated]"
+        candidate = [
+            "",
+            f"[R{rank}] {item['title']}",
+            f"URL: {item['url']}",
+            *(["Date: " + "; ".join(dates)] if dates else []),
+            "Excerpt: " + (excerpt or "(No excerpt returned.)"),
+        ]
+        if len("\n".join([*lines, *candidate])) > EVIDENCE_PACKET_PROMPT_LIMIT:
+            lines.extend(["", "[additional ranked results omitted from this model prompt]"])
+            break
+        lines.extend(candidate)
+    if not outcome.sources:
+        lines.extend(["", "(The search returned no usable HTTP(S) results.)"])
+    return "\n".join(lines)
+
+
 def build_research_messages(
-    store: GraphStore, question: Node, followups: int
+    store: GraphStore,
+    question: Node,
+    followups: int,
+    *,
+    retrieval: SearchOutcome | None = None,
 ) -> list[dict[str, str]]:
+    evidence = _evidence_packet(retrieval)
     prompt = f"""Research this question:
 
 {question.title}
 
 {_research_context(store, question)}
+
+{evidence}
 
 Return a concise but substantive answer, atomic claims with supporting source URLs, explicit
 uncertainties, and up to {followups} high-information follow-up questions. Follow-ups should open
@@ -516,10 +586,12 @@ def _sources_from_responses(
     by_snapshot: dict[str, Source] = {}
     url_to_source: dict[str, str] = {}
     now = utc_now()
-    citations: list[dict[str, str]] = []
+    citations: list[tuple[dict[str, str], str, bool]] = []
     for response in responses:
-        citations.extend(_annotation_citations(response))
-    annotated_urls = {citation["url"] for citation in citations}
+        citations.extend(
+            (citation, response.provider_name, True) for citation in _annotation_citations(response)
+        )
+    annotated_urls = {citation["url"] for citation, _, _ in citations}
     for value in parsed_values:
         for claim in value.get("claims", []):
             if not isinstance(claim, dict):
@@ -530,10 +602,16 @@ def _sources_from_responses(
                     and url.startswith(("http://", "https://"))
                     and url not in annotated_urls
                 ):
-                    citations.append({"url": url, "title": url, "content": ""})
+                    citations.append(
+                        (
+                            {"url": url, "title": url, "content": ""},
+                            responses[-1].provider_name if responses else "unknown",
+                            False,
+                        )
+                    )
                     annotated_urls.add(url)
 
-    for citation in citations:
+    for citation, provider_name, provider_excerpt in citations:
         url = citation["url"]
         content = citation["content"][:12000]
         source_id = stable_source_id(url, content)
@@ -546,7 +624,15 @@ def _sources_from_responses(
                 retrieved_at=now,
                 content_hash=content_hash(content),
                 excerpt=content,
-                metadata={"via": "openrouter_web_search"},
+                metadata={
+                    "via": (
+                        f"{provider_name}_web_search" if provider_excerpt else "model_claim_url"
+                    ),
+                    "provider": provider_name,
+                    "evidence_scope": (
+                        "provider_excerpt" if provider_excerpt else "unfetched_claim_url"
+                    ),
+                },
             )
         # Prefer the richer snapshot when a URL appears in both an annotation and claim list.
         existing_id = url_to_source.get(url)
@@ -555,6 +641,31 @@ def _sources_from_responses(
         ):
             url_to_source[url] = source_id
     return list(by_snapshot.values()), url_to_source
+
+
+def _prefer_retrieved_snapshots(
+    sources: list[Source],
+    url_map: dict[str, str],
+    retrieved: list[Source],
+    *,
+    force: bool = False,
+) -> tuple[list[Source], dict[str, str]]:
+    """Use richer frozen search excerpts for URLs cited by the model."""
+    if not retrieved:
+        return sources, url_map
+    source_map = {source.id: source for source in sources}
+    retrieved_by_url: dict[str, Source] = {}
+    for source in retrieved:
+        # Search results are ranked. A bare model citation cannot distinguish snapshots with the
+        # same URL, so consistently attach the highest-ranked one.
+        retrieved_by_url.setdefault(source.url, source)
+    for url, existing_id in list(url_map.items()):
+        candidate = retrieved_by_url.get(url)
+        if candidate and (force or len(candidate.excerpt) >= len(source_map[existing_id].excerpt)):
+            source_map[candidate.id] = candidate
+            url_map[url] = candidate.id
+    selected_ids = set(url_map.values())
+    return [source for source in source_map.values() if source.id in selected_ids], url_map
 
 
 def _source_ids_for_claim(claim: dict[str, Any], url_map: dict[str, str]) -> list[str]:
@@ -582,6 +693,163 @@ def _answer_body(value: dict[str, Any], sources: list[Source], *, extra: str = "
     return body + "\n"
 
 
+def resolve_search_provider(
+    settings: dict[str, Any],
+    *,
+    web: bool | None = None,
+    search_provider: str | None = None,
+) -> str:
+    """Resolve new provider selection while preserving the original --web contract."""
+    allowed = {"none", "openrouter", "perplexity", "both"}
+    if search_provider not in allowed | {None}:
+        raise ValidationError(f"unknown search provider: {search_provider}")
+    if search_provider is not None:
+        if web is not None:
+            raise ValidationError("--web/--no-web cannot be combined with --search-provider")
+        return search_provider
+    if web is True:
+        return "openrouter"
+    if web is False or not settings.get("web_search", True):
+        return "none"
+    configured = settings.get("search_provider", "openrouter")
+    if configured not in allowed:
+        raise ValidationError(f"project has unknown search provider: {configured}")
+    return configured
+
+
+def _search_sources(response: SearchResponse) -> tuple[list[Source], list[dict[str, Any]]]:
+    now = utc_now()
+    sources: list[Source] = []
+    source_map: dict[str, Source] = {}
+    ranked: list[dict[str, Any]] = []
+    for rank, result in enumerate(response.results, 1):
+        source_id: str | None = None
+        if result.url.startswith(("http://", "https://")):
+            excerpt = result.snippet[:SOURCE_SNAPSHOT_LIMIT]
+            source_id = stable_source_id(result.url, excerpt)
+            source = Source(
+                id=source_id,
+                url=result.url,
+                title=result.title,
+                retrieved_at=now,
+                content_hash=content_hash(excerpt),
+                excerpt=excerpt,
+                source_type="web_search",
+                published_at=result.published_at,
+                metadata={
+                    "via": f"{response.provider_name}_search",
+                    "provider": response.provider_name,
+                    "evidence_scope": "search_excerpt",
+                },
+            )
+            existing = source_map.get(source_id)
+            if existing and (existing.url, existing.excerpt, existing.content_hash) != (
+                source.url,
+                source.excerpt,
+                source.content_hash,
+            ):
+                raise ValidationError(f"source snapshot ID collision: {source_id}")
+            if existing is None:
+                source_map[source_id] = source
+                sources.append(source)
+        ranked.append(
+            {
+                "rank": rank,
+                "source_id": source_id,
+                "title": result.title,
+                "url": result.url,
+                "published_at": result.published_at,
+                "last_updated": result.last_updated,
+            }
+        )
+    return sources, ranked
+
+
+def _canonical_existing_source(store: GraphStore, candidate: Source) -> Source:
+    existing = store.load_source(candidate.id)
+    if (existing.url, existing.excerpt, existing.content_hash) != (
+        candidate.url,
+        candidate.excerpt,
+        candidate.content_hash,
+    ):
+        raise ValidationError(f"source snapshot ID collision: {candidate.id}")
+    return existing
+
+
+def search_question(
+    store: GraphStore,
+    question_reference: str,
+    *,
+    client: SearchProvider,
+    query: str | None = None,
+    options: SearchOptions | None = None,
+    cursor: str = "default",
+) -> SearchOutcome:
+    """Retrieve and durably attach ranked web evidence without synthesizing an answer."""
+    question = store.load_node(store.resolve_node_id(question_reference, cursor=cursor))
+    if question.type != "question":
+        raise ValidationError(f"search expects a question node, got {question.type}: {question.id}")
+    chosen_query = (question.title if query is None else query).strip()
+    if not chosen_query:
+        raise ValidationError("search query cannot be empty")
+    response = client.search(query=chosen_query, options=options)
+    response.provider_name = response.provider_name or client.provider_name
+    sources, ranked_results = _search_sources(response)
+    created = utc_now()
+    run = ModelRun(
+        id=new_id("run"),
+        mode="search",
+        question_id=question.id,
+        created_at=created,
+        provider=response.provider_name or client.provider_name,
+        requested_models=[],
+        resolved_models=[],
+        prompt_hash=prompt_hash(canonical_json(response.request)),
+        source_ids=sorted(source.id for source in sources),
+        usage=dict(response.usage),
+        raw={
+            "request": response.request,
+            "request_id": response.request_id,
+            "server_time": response.server_time,
+            "ranked_results": ranked_results,
+            "response": response.raw,
+        },
+    )
+    with store.locked():
+        # Snapshot IDs deliberately ignore mutable titles/dates. Resolve under the write lock so
+        # concurrent identical searches return the same canonical metadata as disk.
+        sources = [
+            _canonical_existing_source(store, source)
+            if store.source_path(source.id).exists()
+            else source
+            for source in sources
+        ]
+        question = store.load_node(question.id)
+        project = store.load_project()
+        question.source_ids = sorted(set(question.source_ids) | {source.id for source in sources})
+        question.run_ids = sorted(set(question.run_ids) | {run.id})
+        question.updated_at = created
+        for source in sources:
+            source.validate()
+        question.validate()
+        run.validate()
+        paths = [
+            *(store.source_path(source.id) for source in sources),
+            store.node_path(question.id),
+            store.run_path(run.id),
+            store.project_path,
+            store.views_dir / "overview.md",
+        ]
+        with store.transaction(paths):
+            for source in sources:
+                store.save_source(source)
+            store.save_node(question)
+            store.save_run(run)
+            store.save_project(project)
+            write_overview(store, cursor=cursor)
+    return SearchOutcome(chosen_query, run, sources, response)
+
+
 def _persist_outcome(
     store: GraphStore,
     *,
@@ -593,16 +861,58 @@ def _persist_outcome(
     raw: dict[str, Any],
     cursor: str,
     perspective_values: list[tuple[str, dict[str, Any], ProviderResponse]] | None = None,
+    retrieval: SearchOutcome | None = None,
+    provider_name: str | None = None,
 ) -> ResearchOutcome:
-    run_sources, _ = _sources_from_responses(
+    run_sources, run_url_map = _sources_from_responses(
         responses, [value, *(item[1] for item in (perspective_values or []))]
     )
     final_sources, final_url_map = _sources_from_responses([responses[-1]], [value])
+    retrieved_sources = retrieval.sources if retrieval else []
+    retrieved_urls = {source.url for source in retrieved_sources}
+    restrict_to_retrieval = retrieval is not None and raw.get("search_provider") == "perplexity"
+    run_sources, _ = _prefer_retrieved_snapshots(
+        run_sources, run_url_map, retrieved_sources, force=restrict_to_retrieval
+    )
+    if restrict_to_retrieval:
+        allowed_run_source_ids = {
+            source_id for url, source_id in run_url_map.items() if url in retrieved_urls
+        }
+        run_sources = [source for source in run_sources if source.id in allowed_run_source_ids]
+    final_sources, final_url_map = _prefer_retrieved_snapshots(
+        final_sources, final_url_map, retrieved_sources, force=restrict_to_retrieval
+    )
+    if restrict_to_retrieval:
+        final_url_map = {
+            url: source_id for url, source_id in final_url_map.items() if url in retrieved_urls
+        }
+        final_sources = [
+            source for source in final_sources if source.id in set(final_url_map.values())
+        ]
     perspective_evidence: dict[str, tuple[list[Source], dict[str, str]]] = {
-        label: _sources_from_responses([response], [perspective])
+        label: _prefer_retrieved_snapshots(
+            *_sources_from_responses([response], [perspective]),
+            retrieved_sources,
+            force=restrict_to_retrieval,
+        )
         for label, perspective, response in perspective_values or []
     }
-    source_map = {source.id: source for source in [*run_sources, *final_sources]}
+    if restrict_to_retrieval:
+        perspective_evidence = {
+            label: (
+                [
+                    source
+                    for source in sources
+                    if source.id
+                    in {source_id for url, source_id in url_map.items() if url in retrieved_urls}
+                ],
+                {url: source_id for url, source_id in url_map.items() if url in retrieved_urls},
+            )
+            for label, (sources, url_map) in perspective_evidence.items()
+        }
+    source_map = {
+        source.id: source for source in [*retrieved_sources, *run_sources, *final_sources]
+    }
     for perspective_sources, _ in perspective_evidence.values():
         source_map.update({source.id: source for source in perspective_sources})
     sources = list(source_map.values())
@@ -610,6 +920,7 @@ def _persist_outcome(
     created = utc_now()
     all_source_ids = sorted(source_map)
     final_source_ids = sorted(source.id for source in final_sources)
+    linked_run_ids = [run_id, *([retrieval.run.id] if retrieval else [])]
     usage_calls = [response.usage for response in responses]
     costs = [item.get("cost") for item in usage_calls if isinstance(item.get("cost"), (int, float))]
     usage: dict[str, Any] = {"calls": usage_calls}
@@ -642,7 +953,7 @@ def _persist_outcome(
                 updated_at=created,
                 question_id=question.id,
                 source_ids=ids,
-                run_ids=[run_id],
+                run_ids=linked_run_ids,
                 confidence=float(perspective["confidence"]),
                 tags=["council-perspective", "unverified", response.resolved_model],
                 body=_answer_body(
@@ -676,7 +987,7 @@ def _persist_outcome(
             updated_at=created,
             question_id=question.id,
             source_ids=final_source_ids,
-            run_ids=[run_id],
+            run_ids=linked_run_ids,
             confidence=float(value["confidence"]),
             tags=[mode, "unverified"],
             body=_answer_body(value, final_sources, extra="\n\n".join(extra_sections)),
@@ -698,7 +1009,7 @@ def _persist_outcome(
                 question_id=question.id,
                 edges=[Edge(type="derived_from", target=answer.id)],
                 source_ids=_source_ids_for_claim(claim, final_url_map),
-                run_ids=[run_id],
+                run_ids=linked_run_ids,
                 confidence=confidence,
                 tags=["unverified"],
                 body=f"# Claim\n\n{text}\n",
@@ -723,7 +1034,7 @@ def _persist_outcome(
                 created_at=created,
                 updated_at=created,
                 parent_id=question.id,
-                run_ids=[run_id],
+                run_ids=linked_run_ids,
                 tags=[f"priority-{priority}"],
                 body=f"# {title}\n\nWhy this branch matters: {rationale}\n",
             )
@@ -754,7 +1065,7 @@ def _persist_outcome(
             mode=mode,
             question_id=question.id,
             created_at=created,
-            provider="openrouter",
+            provider=provider_name or responses[-1].provider_name,
             requested_models=requested_models,
             resolved_models=[response.resolved_model for response in responses],
             prompt_hash=prompt_hash(json.dumps(raw.get("prompts", []), sort_keys=True)),
@@ -812,9 +1123,12 @@ def ask_question(
     store: GraphStore,
     question_reference: str,
     *,
-    client: OpenRouterClient,
+    client: ChatProvider,
+    retriever: SearchProvider | None = None,
     model: str | None = None,
     web: bool | None = None,
+    search_provider: str | None = None,
+    search_options: SearchOptions | None = None,
     reasoning_effort: str | None = None,
     followups: int = 4,
     cursor: str = "default",
@@ -825,18 +1139,58 @@ def ask_question(
     project = store.load_project()
     settings = project.settings
     chosen_model = model or settings["default_model"]
-    use_web = settings.get("web_search", True) if web is None else web
+    selected_search = resolve_search_provider(settings, web=web, search_provider=search_provider)
+    use_web = selected_search in {"openrouter", "both"}
     effort = reasoning_effort or settings.get("reasoning_effort", "high")
-    messages = build_research_messages(store, question, followups)
+    max_results = (
+        search_options.max_results
+        if search_options is not None
+        else int(settings.get("max_search_results", 8))
+    )
+    retrieval: SearchOutcome | None = None
+    if selected_search in {"perplexity", "both"}:
+        if retriever is None:
+            raise ValidationError(
+                f"search provider {selected_search} requires an injected retrieval client"
+            )
+        options = search_options or SearchOptions(max_results=max_results)
+        retrieval = search_question(
+            store,
+            question.id,
+            client=retriever,
+            options=options,
+            cursor=cursor,
+        )
+    messages = build_research_messages(store, question, followups, retrieval=retrieval)
     response = client.chat(
         model=chosen_model,
         messages=messages,
         web=use_web,
         reasoning_effort=effort,
         response_schema=ANSWER_SCHEMA,
-        max_search_results=int(settings.get("max_search_results", 8)),
+        max_search_results=max_results,
     )
-    value = validate_answer(parse_json_content(response.content))
+    response.provider_name = getattr(client, "provider_name", response.provider_name)
+    parsed_value: dict[str, Any] | None = None
+    try:
+        parsed_value = parse_json_content(response.content)
+        value = validate_answer(parsed_value)
+    except ProviderError as exc:
+        attempt_run = _persist_failed_ask_attempt(
+            store,
+            question=question,
+            response=response,
+            requested_model=chosen_model,
+            messages=messages,
+            error=str(exc),
+            parsed_value=parsed_value,
+            retrieval=retrieval,
+            search_provider=selected_search,
+            cursor=cursor,
+        )
+        raise ProviderError(
+            f"model returned invalid output; preserved attempt as {attempt_run.id}: {exc}"
+        ) from exc
     return _persist_outcome(
         store,
         question=question,
@@ -844,12 +1198,28 @@ def ask_question(
         responses=[response],
         requested_models=[chosen_model],
         mode="ask",
-        raw={"prompts": messages, "response": response.raw, "parsed": value},
+        raw={
+            "prompts": messages,
+            "response": response.raw,
+            "parsed": value,
+            "search_provider": selected_search,
+            "retrieval": (
+                {
+                    "run_id": retrieval.run.id,
+                    "provider": retrieval.run.provider,
+                    "source_ids": retrieval.run.source_ids,
+                }
+                if retrieval
+                else None
+            ),
+        },
         cursor=cursor,
+        retrieval=retrieval,
+        provider_name=getattr(client, "provider_name", response.provider_name),
     )
 
 
-def _parallel_calls(client: OpenRouterClient, calls: dict[str, dict[str, Any]]):
+def _parallel_calls(client: ChatProvider, calls: dict[str, dict[str, Any]]):
     successes: dict[str, ProviderResponse] = {}
     errors: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=min(len(calls), 8)) as executor:
@@ -859,10 +1229,100 @@ def _parallel_calls(client: OpenRouterClient, calls: dict[str, dict[str, Any]]):
         for future in as_completed(future_to_name):
             name = future_to_name[future]
             try:
-                successes[name] = future.result()
+                response = future.result()
+                response.provider_name = getattr(client, "provider_name", response.provider_name)
+                successes[name] = response
             except Exception as exc:  # each council member may fail independently
                 errors[name] = str(exc)
     return successes, errors
+
+
+def _persist_failed_ask_attempt(
+    store: GraphStore,
+    *,
+    question: Node,
+    response: ProviderResponse,
+    requested_model: str,
+    messages: list[dict[str, str]],
+    error: str,
+    parsed_value: dict[str, Any] | None,
+    retrieval: SearchOutcome | None,
+    search_provider: str,
+    cursor: str,
+) -> ModelRun:
+    """Keep paid single-model output even when its structured contract is invalid."""
+    sources, url_map = _sources_from_responses(
+        [response], [parsed_value] if parsed_value is not None else []
+    )
+    retrieved_sources = retrieval.sources if retrieval else []
+    sources, url_map = _prefer_retrieved_snapshots(
+        sources,
+        url_map,
+        retrieved_sources,
+        force=retrieval is not None and search_provider == "perplexity",
+    )
+    if retrieval is not None and search_provider == "perplexity":
+        retrieved_urls = {source.url for source in retrieved_sources}
+        allowed_ids = {source_id for url, source_id in url_map.items() if url in retrieved_urls}
+        sources = [source for source in sources if source.id in allowed_ids]
+    source_map = {source.id: source for source in retrieved_sources}
+    source_map.update({source.id: source for source in sources})
+    sources = list(source_map.values())
+    usage: dict[str, Any] = {"calls": [response.usage]}
+    if isinstance(response.usage.get("cost"), (int, float)) and not isinstance(
+        response.usage.get("cost"), bool
+    ):
+        usage["total_cost"] = response.usage["cost"]
+    run = ModelRun(
+        id=new_id("run"),
+        mode="ask",
+        question_id=question.id,
+        created_at=utc_now(),
+        provider=response.provider_name,
+        requested_models=[requested_model],
+        resolved_models=[response.resolved_model],
+        prompt_hash=prompt_hash(json.dumps(messages, sort_keys=True)),
+        source_ids=sorted(source_map),
+        usage=usage,
+        raw={
+            "status": "failed_validation",
+            "error": error,
+            "prompts": messages,
+            "response": response.raw,
+            "parsed": parsed_value,
+            "search_provider": search_provider,
+            "retrieval": (
+                {
+                    "run_id": retrieval.run.id,
+                    "provider": retrieval.run.provider,
+                    "source_ids": retrieval.run.source_ids,
+                }
+                if retrieval
+                else None
+            ),
+        },
+    )
+    with store.locked():
+        question = store.load_node(question.id)
+        project = store.load_project()
+        question.run_ids = sorted(set(question.run_ids) | {run.id})
+        question.source_ids = sorted(set(question.source_ids) | set(run.source_ids))
+        question.updated_at = run.created_at
+        paths = [
+            *(store.source_path(source.id) for source in sources),
+            store.node_path(question.id),
+            store.run_path(run.id),
+            store.project_path,
+            store.views_dir / "overview.md",
+        ]
+        with store.transaction(paths):
+            for source in sources:
+                store.save_source(source)
+            store.save_node(question)
+            store.save_run(run)
+            store.save_project(project)
+            write_overview(store, cursor=cursor)
+    return run
 
 
 def _persist_failed_council_attempt(
@@ -886,6 +1346,10 @@ def _persist_failed_council_attempt(
     stage1_values: list[dict[str, Any]] | None = None,
     chairman_value: dict[str, Any] | None = None,
     failure_stage: str = "before_review",
+    retrieval: SearchOutcome | None = None,
+    provider_name: str = "openrouter",
+    search_provider: str = "openrouter",
+    cursor: str = "default",
 ) -> ModelRun:
     """Preserve paid calls even when a council cannot produce a synthesis."""
     reviewer_models = reviewer_models or []
@@ -910,16 +1374,32 @@ def _persist_failed_council_attempt(
         ),
         *([(chairman, chairman_response)] if chairman_response else []),
     ]
-    sources, _ = _sources_from_responses(
+    sources, source_url_map = _sources_from_responses(
         [response for _, response in response_pairs],
         [*(stage1_values or []), *([chairman_value] if chairman_value else [])],
     )
+    retrieved_sources = retrieval.sources if retrieval else []
+    sources, _ = _prefer_retrieved_snapshots(
+        sources,
+        source_url_map,
+        retrieved_sources,
+        force=retrieval is not None and search_provider == "perplexity",
+    )
+    if retrieval is not None and search_provider == "perplexity":
+        retrieved_urls = {source.url for source in retrieved_sources}
+        allowed_source_ids = {
+            source_id for url, source_id in source_url_map.items() if url in retrieved_urls
+        }
+        sources = [source for source in sources if source.id in allowed_source_ids]
+    source_map = {source.id: source for source in retrieved_sources}
+    source_map.update({source.id: source for source in sources})
+    sources = list(source_map.values())
     run = ModelRun(
         id=new_id("run"),
         mode="council",
         question_id=question.id,
         created_at=utc_now(),
-        provider="openrouter",
+        provider=provider_name,
         requested_models=[model for model, _ in response_pairs],
         resolved_models=[response.resolved_model for _, response in response_pairs],
         prompt_hash=prompt_hash(
@@ -992,11 +1472,21 @@ def _persist_failed_council_attempt(
             "reviews": {name: response.raw for name, response in reviews.items()},
             "review_errors": review_errors,
             "chairman": chairman_response.raw if chairman_response else None,
+            "retrieval": (
+                {
+                    "run_id": retrieval.run.id,
+                    "provider": retrieval.run.provider,
+                    "source_ids": retrieval.run.source_ids,
+                }
+                if retrieval
+                else None
+            ),
         },
     )
     with store.locked():
         question = store.load_node(question.id)
         question.run_ids = sorted(set(question.run_ids) | {run.id})
+        question.source_ids = sorted(set(question.source_ids) | set(run.source_ids))
         project = store.load_project()
         with store.transaction(
             [
@@ -1012,7 +1502,7 @@ def _persist_failed_council_attempt(
             store.save_run(run)
             store.update_node(question)
             store.save_project(project)
-            write_overview(store)
+            write_overview(store, cursor=cursor)
     return run
 
 
@@ -1020,10 +1510,13 @@ def run_council(
     store: GraphStore,
     question_reference: str,
     *,
-    client: OpenRouterClient,
+    client: ChatProvider,
+    retriever: SearchProvider | None = None,
     models: list[str] | None = None,
     chairman_model: str | None = None,
     web: bool | None = None,
+    search_provider: str | None = None,
+    search_options: SearchOptions | None = None,
     reasoning_effort: str | None = None,
     followups: int = 5,
     cursor: str = "default",
@@ -1038,10 +1531,29 @@ def run_council(
     if len(selected_models) < 2:
         raise ValidationError("a council needs at least two models")
     chairman = chairman_model or settings["chairman_model"]
-    use_web = settings.get("web_search", True) if web is None else web
+    selected_search = resolve_search_provider(settings, web=web, search_provider=search_provider)
+    use_web = selected_search in {"openrouter", "both"}
     effort = reasoning_effort or settings.get("reasoning_effort", "high")
-    max_results = int(settings.get("max_search_results", 8))
-    messages = build_research_messages(store, question, followups)
+    max_results = (
+        search_options.max_results
+        if search_options is not None
+        else int(settings.get("max_search_results", 8))
+    )
+    retrieval: SearchOutcome | None = None
+    if selected_search in {"perplexity", "both"}:
+        if retriever is None:
+            raise ValidationError(
+                f"search provider {selected_search} requires an injected retrieval client"
+            )
+        retrieval = search_question(
+            store,
+            question.id,
+            client=retriever,
+            options=search_options or SearchOptions(max_results=max_results),
+            cursor=cursor,
+        )
+    evidence = _evidence_packet(retrieval)
+    messages = build_research_messages(store, question, followups, retrieval=retrieval)
 
     stage1_calls = {
         f"member-{index + 1}": {
@@ -1077,6 +1589,10 @@ def run_council(
             stage1_errors=stage1_errors,
             messages=messages,
             stage1_values=parsed_stage1_values,
+            retrieval=retrieval,
+            provider_name=getattr(client, "provider_name", "openrouter"),
+            search_provider=selected_search,
+            cursor=cursor,
         )
         raise ProviderError(
             "fewer than two council members returned valid answers; preserved attempt as "
@@ -1109,6 +1625,8 @@ def run_council(
                 "content": f"""Blind-review independent answers to this research question:
 
 {question.title}
+
+{evidence}
 
 {shuffled_packet}
 
@@ -1152,6 +1670,8 @@ response label. The response labels are anonymous.
 
 {question.title}
 
+{evidence}
+
 Independent responses:
 
 {response_packet}
@@ -1177,6 +1697,9 @@ propose up to {followups} high-information next questions.
             max_search_results=max_results,
             max_tokens=10000,
         )
+        chairman_response.provider_name = getattr(
+            client, "provider_name", chairman_response.provider_name
+        )
     except Exception as exc:
         attempt_run = _persist_failed_council_attempt(
             store,
@@ -1196,6 +1719,10 @@ propose up to {followups} high-information next questions.
             chairman_messages=chairman_messages,
             stage1_values=parsed_stage1_values,
             failure_stage="chairman",
+            retrieval=retrieval,
+            provider_name=getattr(client, "provider_name", "openrouter"),
+            search_provider=selected_search,
+            cursor=cursor,
         )
         raise ProviderError(
             f"chairman failed; preserved attempt as {attempt_run.id}: {exc}"
@@ -1222,6 +1749,10 @@ propose up to {followups} high-information next questions.
             chairman_messages=chairman_messages,
             stage1_values=parsed_stage1_values,
             failure_stage="chairman_validation",
+            retrieval=retrieval,
+            provider_name=getattr(client, "provider_name", "openrouter"),
+            search_provider=selected_search,
+            cursor=cursor,
         )
         raise ProviderError(
             f"chairman returned invalid output; preserved attempt as {attempt_run.id}: {exc}"
@@ -1296,6 +1827,16 @@ propose up to {followups} high-information next questions.
         "parsed_reviews": parsed_reviews,
         "chairman": chairman_response.raw,
         "parsed": final_value,
+        "search_provider": selected_search,
+        "retrieval": (
+            {
+                "run_id": retrieval.run.id,
+                "provider": retrieval.run.provider,
+                "source_ids": retrieval.run.source_ids,
+            }
+            if retrieval
+            else None
+        ),
     }
     return _persist_outcome(
         store,
@@ -1307,6 +1848,8 @@ propose up to {followups} high-information next questions.
         raw=raw,
         cursor=cursor,
         perspective_values=perspective_values,
+        retrieval=retrieval,
+        provider_name=getattr(client, "provider_name", chairman_response.provider_name),
     )
 
 
@@ -1391,7 +1934,7 @@ def verify_claims(
     store: GraphStore,
     target_reference: str,
     *,
-    client: OpenRouterClient,
+    client: ChatProvider,
     model: str | None = None,
     reasoning_effort: str | None = None,
     cursor: str = "default",
@@ -1471,6 +2014,7 @@ Frozen evidence packet:
         response_schema=VERIFY_SCHEMA,
         max_tokens=7000,
     )
+    response.provider_name = getattr(client, "provider_name", response.provider_name)
     value = validate_verification(
         parse_json_content(response.content),
         {claim.id: set(claim.source_ids) for claim in claims},
@@ -1557,7 +2101,7 @@ Frozen evidence packet:
         or claims[0].question_id
         or store.load_project().root_question_id,
         created_at=created,
-        provider="openrouter",
+        provider=getattr(client, "provider_name", response.provider_name),
         requested_models=[chosen_model],
         resolved_models=[response.resolved_model],
         prompt_hash=prompt_hash(json.dumps(messages, sort_keys=True)),

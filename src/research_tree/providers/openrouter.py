@@ -7,26 +7,15 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from ..errors import ConfigurationError, ProviderError
+from .base import ProviderResponse
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-
-
-@dataclass
-class ProviderResponse:
-    content: str
-    requested_model: str
-    resolved_model: str
-    annotations: list[dict[str, Any]] = field(default_factory=list)
-    usage: dict[str, Any] = field(default_factory=dict)
-    response_id: str = ""
-    raw: dict[str, Any] = field(default_factory=dict)
 
 
 def _key_from_research_config() -> str | None:
@@ -34,6 +23,8 @@ def _key_from_research_config() -> str | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
         return None
     value = data.get("openrouter_api_key")
     return value.strip() if isinstance(value, str) and value.strip() else None
@@ -44,6 +35,8 @@ def _key_from_fluff_cutter() -> str | None:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
         return None
     value = data.get("openrouter_api_key")
     return value.strip() if isinstance(value, str) and value.strip() else None
@@ -194,4 +187,5 @@ class OpenRouterClient:
             usage=dict(data.get("usage") or {}),
             response_id=str(data.get("id") or ""),
             raw=data,
+            provider_name=self.provider_name,
         )

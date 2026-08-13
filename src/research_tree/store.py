@@ -31,6 +31,7 @@ DEFAULT_SETTINGS = {
     "default_model": "~openai/gpt-latest",
     "reasoning_effort": "high",
     "web_search": True,
+    "search_provider": "openrouter",
     "max_search_results": 8,
     "council_models": [
         "~openai/gpt-latest",
