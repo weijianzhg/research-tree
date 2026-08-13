@@ -73,9 +73,9 @@ For questions where disagreement matters:
 
 ```bash
 research-tree --root ./research council focus \
-  --model '~openai/gpt-5:latest' \
-  --model '~anthropic/claude-sonnet-4.5:latest' \
-  --model '~google/gemini-2.5-pro:latest'
+  --model '~openai/gpt-5.6-sol-pro' \
+  --model '~anthropic/claude-opus-5' \
+  --model '~x-ai/grok-4.6'
 ```
 
 Council mode runs independent evidence searches, anonymized peer reviews, and a chairman synthesis.

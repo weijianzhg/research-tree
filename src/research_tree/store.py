@@ -33,9 +33,9 @@ DEFAULT_SETTINGS = {
     "web_search": True,
     "max_search_results": 8,
     "council_models": [
-        "~openai/gpt-5:latest",
-        "~anthropic/claude-sonnet-4.5:latest",
-        "~google/gemini-2.5-pro:latest",
+        "~openai/gpt-5.6-sol-pro",
+        "~anthropic/claude-opus-5",
+        "~x-ai/grok-4.6",
     ],
     "chairman_model": "~openai/gpt-5:latest",
 }
