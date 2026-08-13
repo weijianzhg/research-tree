@@ -4,7 +4,7 @@ Research Tree is a terminal-first, Git-native workspace for branching research. 
 question you are exploring, the paths you have opened, the answers you have received, the claims
 those answers make, their evidence, and the exact model runs that produced them.
 
-It is designed to sit underneath an agent such as [Pi](https://pi.dev/) and beside a writing vault.
+It is designed to sit underneath an agent such as [Pi](https://pi.dev/).
 The agent is the conversational interface; Research Tree is the durable, inspectable memory.
 
 ## Why a tree *and* a graph?
@@ -120,17 +120,8 @@ Model-generated answers must be verified and non-contested before promotion. Del
 hatches (`--allow-unverified`, `--allow-uncertain`) are available for exploratory notes, but are
 never automatic.
 
-The Writing Vault integration exposes the same operations as:
-
-```bash
-writing explore <topic> start "root research question"
-writing explore <topic> tree
-writing explore <topic> ask focus
-writing explore <topic> promote y_abc123
-```
-
 Research Tree does not commit or push on its own. This is deliberate: one investigation can create
-many related files, and a writing agent should batch them into one meaningful vault sync.
+many related files, and a writing agent should batch them into one meaningful sync.
 
 ## Canonical layout
 
