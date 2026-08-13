@@ -83,6 +83,8 @@ It preserves each model's answer and the minority views; consensus is recorded a
 treated as truth. A three-model council makes seven paid completions (three answers, three reviews,
 one synthesis), so it is intentionally explicit rather than automatic.
 
+The council idea is inspired by [Andrej Karpathy's LLM Council](https://github.com/karpathy/llm-council).
+
 ## Navigation
 
 ```bash
