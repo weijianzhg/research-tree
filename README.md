@@ -57,7 +57,7 @@ research-tree --root ./research branch \
 research-tree --root ./research where
 research-tree --root ./research tree
 research-tree --root ./research ask focus
-research-tree --root ./research verify a_abc123 --model '~anthropic/claude-sonnet-latest'
+research-tree --root ./research verify a_abc123 --model '~anthropic/claude-sonnet-4.5:latest'
 research-tree --root ./research next --from root
 ```
 
@@ -73,9 +73,9 @@ For questions where disagreement matters:
 
 ```bash
 research-tree --root ./research council focus \
-  --model '~openai/gpt-latest' \
-  --model '~anthropic/claude-sonnet-latest' \
-  --model '~google/gemini-pro-latest'
+  --model '~openai/gpt-5:latest' \
+  --model '~anthropic/claude-sonnet-4.5:latest' \
+  --model '~google/gemini-2.5-pro:latest'
 ```
 
 Council mode runs independent evidence searches, anonymized peer reviews, and a chairman synthesis.
