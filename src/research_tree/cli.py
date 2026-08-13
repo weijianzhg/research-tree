@@ -15,13 +15,16 @@ from . import __version__
 from .doctor import inspect_graph
 from .errors import (
     ConfigurationError,
+    ModelOutputError,
     NotFoundError,
     ProviderError,
     ResearchTreeError,
+    ValidationError,
 )
 from .models import Source, content_hash, stable_source_id, utc_now
 from .providers import OpenRouterClient
 from .render import (
+    STATUS_LEGEND,
     frontier,
     graph_data,
     render_graph,
@@ -30,7 +33,13 @@ from .render import (
     render_where,
     write_overview,
 )
-from .research import ask_question, record_manual_answer, run_council, verify_claims
+from .research import (
+    ask_question,
+    record_manual_answer,
+    run_council,
+    synthesize_answers,
+    verify_claims,
+)
 from .store import GraphStore, _atomic_write, load_store
 
 EXIT_NOT_FOUND = 3
@@ -167,11 +176,10 @@ def cmd_branch(args):
         project = store.load_project()
         store.save_project(project)
         write_overview(store, cursor=args.cursor)
-    emit(
-        _node_json(node),
-        as_json=args.json,
-        human=f"Branched to {node.id} [{node.status}] — {node.title}",
-    )
+    human = f"Branched to {node.id} [{node.status}] — {node.title} (under {node.parent_id})"
+    if not args.stay:
+        human += f"\nFocused {args.cursor} on {node.id}."
+    emit(_node_json(node), as_json=args.json, human=human)
 
 
 def cmd_answer(args):
@@ -268,28 +276,65 @@ def cmd_verify(args):
     emit(_verification_json(outcome), as_json=args.json, human=human)
 
 
+def cmd_synthesize(args):
+    store = _store(args)
+    chosen = args.model or store.load_project().settings["default_model"]
+    if not args.json:
+        print(
+            f"Synthesizing answers under {args.node} with {chosen}...",
+            file=sys.stderr,
+        )
+    outcome = synthesize_answers(
+        store,
+        args.node,
+        client=OpenRouterClient(),
+        model=args.model,
+        reasoning_effort=args.effort,
+        cursor=args.cursor,
+    )
+    human = render_node(store, outcome.node)
+    if outcome.aggregated:
+        human += "\n\nAggregated answers:\n" + "\n".join(
+            f"  {node_id}" for node_id in outcome.aggregated
+        )
+    if outcome.run.usage.get("total_cost") is not None:
+        human += f"\n\nRecorded cost: ${outcome.run.usage['total_cost']:.4f}"
+    data = {
+        "node": _node_json(outcome.node),
+        "run": outcome.run.to_dict(),
+        "aggregated": outcome.aggregated,
+    }
+    emit(data, as_json=args.json, human=human)
+
+
 def cmd_tree(args):
     store = _store(args)
     text = render_tree(store, start=args.from_node, depth=args.depth, cursor=args.cursor)
-    emit(graph_data(store), as_json=args.json, human=text)
+    emit(graph_data(store), as_json=args.json, human=text + "\n\n" + STATUS_LEGEND)
 
 
 def cmd_next(args):
     store = _store(args)
-    candidates = frontier(store, start=args.from_node, cursor=args.cursor)[: args.limit]
+    start_id = store.resolve_node_id(args.from_node, cursor=args.cursor)
+    candidates = frontier(store, start=start_id, cursor=args.cursor)[: args.limit]
     if args.focus and candidates:
         with store.locked():
             store.set_focus(candidates[0].id, cursor=args.cursor)
-    data = [_node_json(node) for node in candidates]
-    human = (
-        "\n".join(
+    scope = (
+        "the whole tree"
+        if start_id == store.load_project().root_question_id
+        else f"branch {start_id}"
+    )
+    if not candidates:
+        human = f"No unanswered questions in {scope}."
+    else:
+        human = f"Unanswered questions in {scope}:\n" + "\n".join(
             f"{index}. [{node.status}] {node.id} — {node.title}"
             for index, node in enumerate(candidates, 1)
         )
-        or "No unanswered questions in this branch."
-    )
     if args.focus and candidates:
         human += f"\n\nFocused on {candidates[0].id}."
+    data = [_node_json(node) for node in candidates]
     emit(data, as_json=args.json, human=human)
 
 
@@ -376,6 +421,11 @@ def _promotion_markdown(store: GraphStore, node) -> str:
 def cmd_promote(args):
     store = _store(args)
     node = store.load_node(store.resolve_node_id(args.node, cursor=args.cursor))
+    if node.type not in {"answer", "synthesis"}:
+        raise ValidationError(
+            f"promote expects an answer or synthesis node, got {node.type}: {node.id}. "
+            "Pass a bare node ID such as a_xxxx or y_xxxx (run `show` for details)."
+        )
     if (
         node.type in {"answer", "synthesis"}
         and "manual" not in node.tags
@@ -586,13 +636,19 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--effort", choices=["minimal", "low", "medium", "high", "xhigh", "max"])
     command.set_defaults(func=cmd_verify)
 
+    command = sub.add_parser("synthesize", help="merge answered questions into one synthesis node")
+    command.add_argument("node", nargs="?", default="focus")
+    command.add_argument("--model")
+    command.add_argument("--effort", choices=["minimal", "low", "medium", "high", "xhigh", "max"])
+    command.set_defaults(func=cmd_synthesize)
+
     command = sub.add_parser("tree", help="render the question hierarchy")
     command.add_argument("--from", dest="from_node", default="root")
     command.add_argument("--depth", type=int)
     command.set_defaults(func=cmd_tree)
 
-    command = sub.add_parser("next", help="rank unanswered questions in a branch")
-    command.add_argument("--from", dest="from_node", default="focus")
+    command = sub.add_parser("next", help="rank unanswered questions")
+    command.add_argument("--from", dest="from_node", default="root")
     command.add_argument("--limit", type=int, default=8)
     command.add_argument("--focus", action="store_true", help="focus the first result")
     command.set_defaults(func=cmd_next)
@@ -668,6 +724,9 @@ def main(argv: list[str] | None = None) -> int:
         return result if isinstance(result, int) else 0
     except NotFoundError as exc:
         code = EXIT_NOT_FOUND
+        error_message = str(exc)
+    except ModelOutputError as exc:
+        code = EXIT_VALIDATION
         error_message = str(exc)
     except (ConfigurationError, ProviderError) as exc:
         code = EXIT_PROVIDER

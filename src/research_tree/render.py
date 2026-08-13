@@ -20,6 +20,11 @@ STATUS_MARKS = {
     "parked": "×",
 }
 
+STATUS_LEGEND = (
+    "legend: → focus  · proposed  ? open  ~ researching  ✓ answered  "
+    "! uncertain  ≠ contested  × parked"
+)
+
 
 def _recorded_priority(node: Node) -> int:
     for tag in node.tags:

@@ -85,3 +85,35 @@ def test_promote_blocks_unverified_model_output(tmp_path, capsys):
     assert not target.exists()
     error = json.loads(capsys.readouterr().err)
     assert "has not been verified" in error["error"]
+
+
+def test_promote_rejects_non_answer_node(tmp_path, capsys):
+    store, root = GraphStore.create(tmp_path / "graph", "A root question?")
+    code = main(
+        [
+            "--root",
+            str(store.root),
+            "promote",
+            root.id,
+            "--to",
+            str(tmp_path / "notes.md"),
+            "--json",
+        ]
+    )
+    assert code == EXIT_VALIDATION
+    error = json.loads(capsys.readouterr().err)
+    assert "expects an answer or synthesis node" in error["error"]
+
+
+def test_next_defaults_to_whole_tree_not_focus(tmp_path, capsys):
+    store, root = GraphStore.create(tmp_path / "graph", "A root question?")
+    left = store.add_question("Left", parent="root", focus=False)
+    store.add_question("Right", parent="root", focus=False)
+    store.set_focus(left.id)
+    code = main(["--root", str(store.root), "next", "--json"])
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    ids = {node["id"] for node in data}
+    assert root.id in ids
+    assert left.id in ids
+    assert any(node["title"] == "Right" for node in data)
