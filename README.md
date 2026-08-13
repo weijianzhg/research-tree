@@ -4,7 +4,7 @@ Research Tree is a terminal-first, Git-native workspace for branching research. 
 question you are exploring, the paths you have opened, the answers you have received, the claims
 those answers make, their evidence, and the exact model runs that produced them.
 
-It is designed to sit underneath an agent such as [Pi](https://pi.dev/) and beside a writing vault.
+It is designed to sit underneath an agent such as [Pi](https://pi.dev/).
 The agent is the conversational interface; Research Tree is the durable, inspectable memory.
 
 ## Why a tree *and* a graph?
@@ -57,7 +57,7 @@ research-tree --root ./research branch \
 research-tree --root ./research where
 research-tree --root ./research tree
 research-tree --root ./research ask focus
-research-tree --root ./research verify a_abc123 --model '~anthropic/claude-sonnet-latest'
+research-tree --root ./research verify a_abc123 --model '~anthropic/claude-sonnet-4.5:latest'
 research-tree --root ./research next --from root
 ```
 
@@ -73,15 +73,17 @@ For questions where disagreement matters:
 
 ```bash
 research-tree --root ./research council focus \
-  --model '~openai/gpt-latest' \
-  --model '~anthropic/claude-sonnet-latest' \
-  --model '~google/gemini-pro-latest'
+  --model '~openai/gpt-5.6-sol-pro' \
+  --model '~anthropic/claude-opus-5' \
+  --model '~x-ai/grok-4.6'
 ```
 
 Council mode runs independent evidence searches, anonymized peer reviews, and a chairman synthesis.
 It preserves each model's answer and the minority views; consensus is recorded as a signal, not
 treated as truth. A three-model council makes seven paid completions (three answers, three reviews,
 one synthesis), so it is intentionally explicit rather than automatic.
+
+The council idea is inspired by [Andrej Karpathy's LLM Council](https://github.com/karpathy/llm-council).
 
 ## Navigation
 
@@ -120,17 +122,8 @@ Model-generated answers must be verified and non-contested before promotion. Del
 hatches (`--allow-unverified`, `--allow-uncertain`) are available for exploratory notes, but are
 never automatic.
 
-The Writing Vault integration exposes the same operations as:
-
-```bash
-writing explore <topic> start "root research question"
-writing explore <topic> tree
-writing explore <topic> ask focus
-writing explore <topic> promote y_abc123
-```
-
 Research Tree does not commit or push on its own. This is deliberate: one investigation can create
-many related files, and a writing agent should batch them into one meaningful vault sync.
+many related files, and a writing agent should batch them into one meaningful sync.
 
 ## Canonical layout
 

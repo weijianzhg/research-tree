@@ -29,6 +29,19 @@ class ProviderResponse:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+def normalize_model_id(model: str) -> str:
+    """Return the bare OpenRouter model ID for the requested model string.
+
+    Research Tree accepts Pi's ``~provider/model`` shorthand (e.g.
+    ``~openai/gpt-5:latest``) both in stored defaults and on the command line, but the
+    OpenRouter HTTP API only understands a bare ``provider/model`` ID. A leading ``~``
+    is an alias marker, not part of the model name, so it is stripped here.
+
+    Real OpenRouter IDs such as ``openai/gpt-5-mini`` are passed through unchanged.
+    """
+    return model.lstrip("~")
+
+
 def _key_from_research_config() -> str | None:
     path = Path.home() / ".config" / "research-tree" / "config.json"
     try:
@@ -118,8 +131,9 @@ class OpenRouterClient:
         max_search_results: int = 8,
     ) -> ProviderResponse:
         key = self.api_key or resolve_openrouter_key(model)
+        api_model = normalize_model_id(model)
         payload: dict[str, Any] = {
-            "model": model,
+            "model": api_model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.2,

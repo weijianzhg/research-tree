@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 
 from research_tree.providers import openrouter
-from research_tree.providers.openrouter import OpenRouterClient, resolve_openrouter_key
+from research_tree.providers.openrouter import (
+    OpenRouterClient,
+    normalize_model_id,
+    resolve_openrouter_key,
+)
 from research_tree.research import ANSWER_SCHEMA
 
 
@@ -13,6 +17,15 @@ def test_pi_credential_precedes_legacy_fluff_config(monkeypatch):
     monkeypatch.setattr(openrouter, "_key_from_pi", lambda model: "active-pi-key")
     monkeypatch.setattr(openrouter, "_key_from_fluff_cutter", lambda: "stale-fluff-key")
     assert resolve_openrouter_key("test/model") == "active-pi-key"
+
+
+def test_normalize_model_id_strips_pi_tilde_alias():
+    assert normalize_model_id("~openai/gpt-5:latest") == "openai/gpt-5:latest"
+    assert (
+        normalize_model_id("~anthropic/claude-sonnet-4.5:latest")
+        == "anthropic/claude-sonnet-4.5:latest"
+    )
+    assert normalize_model_id("openai/gpt-5-mini") == "openai/gpt-5-mini"
 
 
 def test_chat_sends_reasoning_web_tools_and_json_schema(monkeypatch):
@@ -44,14 +57,16 @@ def test_chat_sends_reasoning_web_tools_and_json_schema(monkeypatch):
     monkeypatch.setattr(openrouter.urllib.request, "urlopen", fake_urlopen)
     client = OpenRouterClient(api_key="not-a-real-key", base_url="https://router.test/v1")
     response = client.chat(
-        model="requested/model",
+        model="~requested/model",
         messages=[{"role": "user", "content": "Research this"}],
         web=True,
         reasoning_effort="high",
         response_schema=ANSWER_SCHEMA,
     )
     assert captured["url"] == "https://router.test/v1/chat/completions"
+    assert captured["payload"]["model"] == "requested/model"
     assert captured["payload"]["reasoning"]["effort"] == "high"
     assert captured["payload"]["tools"][0]["type"] == "openrouter:web_search"
     assert captured["payload"]["response_format"]["type"] == "json_schema"
+    assert response.requested_model == "~requested/model"
     assert response.resolved_model == "resolved/model"
