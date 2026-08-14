@@ -28,16 +28,16 @@ TRANSACTION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 TRANSACTION_SCHEMA_VERSION = 2
 
 DEFAULT_SETTINGS = {
-    "default_model": "~openai/gpt-5:latest",
+    "default_model": "~deepseek/deepseek-v4-pro-0813",
     "reasoning_effort": "high",
     "web_search": True,
     "max_search_results": 8,
     "council_models": [
-        "~openai/gpt-5.6-sol-pro",
+        "~deepseek/deepseek-v4-pro-0813",
         "~anthropic/claude-opus-5",
         "~x-ai/grok-4.6",
     ],
-    "chairman_model": "~openai/gpt-5:latest",
+    "chairman_model": "~deepseek/deepseek-v4-pro-0813",
 }
 
 
