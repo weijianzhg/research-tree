@@ -28,16 +28,16 @@ TRANSACTION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 TRANSACTION_SCHEMA_VERSION = 2
 
 DEFAULT_SETTINGS = {
-    "default_model": "~openai/gpt-5:latest",
+    "default_model": "~deepseek/deepseek-v4-pro-0813",
     "reasoning_effort": "high",
     "web_search": True,
     "max_search_results": 8,
     "council_models": [
-        "~openai/gpt-5.6-sol-pro",
+        "~deepseek/deepseek-v4-pro-0813",
         "~anthropic/claude-opus-5",
         "~x-ai/grok-4.6",
     ],
-    "chairman_model": "~openai/gpt-5:latest",
+    "chairman_model": "~deepseek/deepseek-v4-pro-0813",
 }
 
 
@@ -877,6 +877,13 @@ class GraphStore:
                     nodes.append(node)
             return nodes
 
+    def is_node_reference(self, reference: str) -> bool:
+        """True when `reference` names a node (or alias) rather than free-form text."""
+        ref = reference.strip()
+        return ref in {"focus", "current", ".", "root", ".."} or bool(
+            NODE_REFERENCE_RE.fullmatch(ref)
+        )
+
     def resolve_node_id(self, reference: str, *, cursor: str = "default") -> str:
         with self.read_locked():
             ref = reference.strip()
@@ -884,6 +891,10 @@ class GraphStore:
                 return self.get_focus(cursor)
             if ref == "root":
                 return self.load_project().root_question_id
+            if ref == "..":
+                focus = self.load_node(self.get_focus(cursor))
+                target = focus.parent_id if focus.type == "question" else focus.question_id
+                return target or focus.id
             if not NODE_REFERENCE_RE.fullmatch(ref):
                 raise ValidationError(
                     f"invalid node reference {reference!r}; use a node ID or unambiguous ID prefix"

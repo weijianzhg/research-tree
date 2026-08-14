@@ -191,7 +191,13 @@ def cmd_answer(args):
 
 def cmd_ask(args):
     store = _store(args)
-    question_id = store.resolve_node_id(args.node, cursor=args.cursor)
+    if store.is_node_reference(args.node):
+        question_id = store.resolve_node_id(args.node, cursor=args.cursor)
+    else:
+        # Free-form question text: create the question node verbatim under focus, then answer it.
+        question_id = store.add_question(
+            args.node, parent="focus", status="open", cursor=args.cursor, focus=True
+        ).id
     settings = store.load_project().settings
     chosen = args.model or settings["default_model"]
     use_web = settings.get("web_search", True) if args.web is None else args.web
@@ -586,7 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.set_defaults(func=cmd_where)
 
     command = sub.add_parser("focus", help="move a local cursor to a node")
-    command.add_argument("node")
+    command.add_argument("node", help="node reference (ID, prefix, focus, root, .. for parent)")
     command.set_defaults(func=cmd_focus)
 
     command = sub.add_parser("branch", help="add a child question")
@@ -606,7 +612,12 @@ def build_parser() -> argparse.ArgumentParser:
     command.set_defaults(func=cmd_answer)
 
     command = sub.add_parser("ask", help="research a question with one model")
-    command.add_argument("node", nargs="?", default="focus")
+    command.add_argument(
+        "node",
+        nargs="?",
+        default="focus",
+        help="node reference (ID, prefix, focus, root, ..) or free-form question text",
+    )
     command.add_argument("--model")
     command.add_argument("--effort", choices=["minimal", "low", "medium", "high", "xhigh", "max"])
     web_group = command.add_mutually_exclusive_group()

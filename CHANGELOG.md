@@ -3,6 +3,18 @@
 All notable changes to Research Tree are documented here. The package follows semantic
 versioning; the on-disk graph format is versioned separately (`schema_version` on each object).
 
+## [0.3.0] - 2026-08-14
+
+### Added
+
+- `ask` now accepts free-form question text in addition to node references. When the argument is
+  not a node reference, `ask` creates a question node with the exact wording under the current
+  focus and answers it in one step, so asking a brand-new question no longer requires a separate
+  `branch` first.
+- `..` resolves to the parent of the current focus (a question's parent, or the owning question
+  for non-question nodes; root stays put), so `focus ..`, `branch --from ..`, and `ask ..` can
+  navigate up and branch at an ancestor without typing full node IDs.
+
 ## [0.2.0] - 2026-08-13
 
 ### Added
