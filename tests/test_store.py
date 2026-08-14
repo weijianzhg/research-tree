@@ -155,6 +155,27 @@ def test_resolve_unique_prefix_and_reject_ambiguous(store):
         store.resolve_node_id("../*")
 
 
+def test_resolve_parent_reference(store):
+    root = store.load_project().root_question_id
+    child = store.add_question("Child", parent="root")
+    grandchild = store.add_question("Grandchild", parent=child.id)
+    assert store.get_focus() == grandchild.id
+    assert store.resolve_node_id("..") == child.id
+    store.set_focus(child.id)
+    assert store.resolve_node_id("..") == root
+    store.set_focus(root)
+    assert store.resolve_node_id("..") == root  # root has no parent; stays put
+
+
+def test_is_node_reference_distinguishes_text(store):
+    assert store.is_node_reference("focus")
+    assert store.is_node_reference("root")
+    assert store.is_node_reference("..")
+    assert store.is_node_reference("q_abc123")
+    assert not store.is_node_reference("How do I secure a call?")
+    assert not store.is_node_reference("  ")
+
+
 def test_cursor_name_cannot_traverse_directories(store):
     with pytest.raises(ValidationError, match="cursor names"):
         store.cursor_path("../../secrets")

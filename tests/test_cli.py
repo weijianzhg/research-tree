@@ -117,3 +117,71 @@ def test_next_defaults_to_whole_tree_not_focus(tmp_path, capsys):
     assert root.id in ids
     assert left.id in ids
     assert any(node["title"] == "Right" for node in data)
+
+
+def test_ask_accepts_free_text_question(tmp_path, capsys, monkeypatch):
+    class FakeClient:
+        def chat(self, **kwargs):
+            return ProviderResponse(
+                content=json.dumps(
+                    {
+                        "answer_markdown": "Bearer tokens alone cannot attribute users.",
+                        "confidence": 0.8,
+                        "claims": [],
+                        "uncertainties": [],
+                        "follow_up_questions": [],
+                    }
+                ),
+                requested_model=kwargs["model"],
+                resolved_model=kwargs["model"],
+            )
+
+    import research_tree.cli as cli
+
+    monkeypatch.setattr(cli, "OpenRouterClient", lambda: FakeClient())
+
+    store, root = GraphStore.create(tmp_path / "graph", "A root question?")
+    code = main(["--root", str(store.root), "ask", "How do I secure a call?", "--json"])
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+
+    questions = [
+        node
+        for node in store.list_nodes(node_type="question")
+        if node.title == "How do I secure a call?"
+    ]
+    assert len(questions) == 1
+    question = questions[0]
+    assert question.parent_id == root.id
+    assert data["answer"]["type"] == "answer"
+    assert data["answer"]["question_id"] == question.id
+    assert store.get_focus() == question.id
+
+
+def test_ask_still_resolves_node_reference(tmp_path, capsys, monkeypatch):
+    class FakeClient:
+        def chat(self, **kwargs):
+            return ProviderResponse(
+                content=json.dumps(
+                    {
+                        "answer_markdown": "A direct answer.",
+                        "confidence": 0.7,
+                        "claims": [],
+                        "uncertainties": [],
+                        "follow_up_questions": [],
+                    }
+                ),
+                requested_model=kwargs["model"],
+                resolved_model=kwargs["model"],
+            )
+
+    import research_tree.cli as cli
+
+    monkeypatch.setattr(cli, "OpenRouterClient", lambda: FakeClient())
+
+    store, root = GraphStore.create(tmp_path / "graph", "A root question?")
+    child = store.add_question("A follow-up?", parent="root", focus=False)
+    code = main(["--root", str(store.root), "ask", child.id, "--json"])
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert data["answer"]["question_id"] == child.id
