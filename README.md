@@ -44,6 +44,30 @@ this order:
 
 All graph-management commands work offline.
 
+## Recording research by hand
+
+Research Tree works as a pure recorder with no model calls at all. Add questions and
+answers yourself, then grow the tree interactively or one command at a time:
+
+```bash
+# one-shot: branch a question and record its answer in a single step
+research-tree --root ./research record "What is top-k routing?" --text "The router scores experts..."
+
+# pipe an answer in (heredoc, file, or editor)
+printf '%s\n' 'Top-k routing keeps the k highest-gated experts.' | research-tree --root ./research record focus
+research-tree --root ./research record focus --file answer.md
+research-tree --root ./research record focus --edit
+
+# interactive recorder: type questions, then `a` to paste an answer
+research-tree --root ./research record
+```
+
+Inside `record` (interactive mode), plain text branches a question, `a` records a
+multi-line answer for the focused question (finish with a line containing only `.`,
+or Ctrl-D), and `t`/`w`/`n`/`c`/`f`/`..`/`e`/`s` navigate, edit, and inspect the tree.
+`quit` leaves the session; every step is saved immediately. Manual answers are tagged
+`manual`, so they promote without model verification.
+
 ## First research session
 
 ```bash
@@ -162,6 +186,7 @@ binary database. See [the format contract](docs/format.md) for entity and relati
 | `where` / `focus` | Inspect or change a named cursor |
 | `branch` | Add an explicit child question |
 | `answer` | Record a human/manual answer |
+| `record` | Record questions and answers yourself (free, offline; interactive) |
 | `ask` | Run one evidence-aware model |
 | `council` | Compare models through blind review and synthesis |
 | `verify` | Check claim-level citation support against frozen excerpts |

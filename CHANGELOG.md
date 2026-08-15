@@ -3,6 +3,16 @@
 All notable changes to Research Tree are documented here. The package follows semantic
 versioning; the on-disk graph format is versioned separately (`schema_version` on each object).
 
+## [0.4.0] - 2026-08-15
+
+### Added
+
+- `record` command: record questions and answers yourself with no model calls. With an argument,
+  it branches a new question (or reuses a node reference) and records an answer from `--text`,
+  `--file`, `--edit`, piped stdin, or an interactive paste prompt in one step; with no argument it
+  opens an interactive recorder session (`record` REPL). Manual answers are tagged `manual`.
+- `answer` now accepts `--edit` to write the answer in `$EDITOR` (`RESEARCH_EDITOR`/`EDITOR`).
+
 ## [0.3.0] - 2026-08-14
 
 ### Added

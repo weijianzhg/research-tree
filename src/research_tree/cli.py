@@ -23,6 +23,7 @@ from .errors import (
 )
 from .models import Source, content_hash, stable_source_id, utc_now
 from .providers import OpenRouterClient
+from .record import read_answer_text, record_repl
 from .render import (
     STATUS_LEGEND,
     frontier,
@@ -184,9 +185,38 @@ def cmd_branch(args):
 
 def cmd_answer(args):
     store = _store(args)
-    text = Path(args.file).read_text(encoding="utf-8") if args.file else args.text
+    text = read_answer_text(text=args.text, file=args.file, edit=args.edit)
     node = record_manual_answer(store, args.node, text, cursor=args.cursor)
     emit(_node_json(node), as_json=args.json, human=f"Saved {node.id} — {node.title}")
+
+
+def cmd_record(args):
+    store = _store(args)
+    if args.node is None:
+        return record_repl(store, cursor=args.cursor)
+    if store.is_node_reference(args.node):
+        question = store.load_node(store.resolve_node_id(args.node, cursor=args.cursor))
+    else:
+        question = store.add_question(
+            args.node, parent="focus", status="open", cursor=args.cursor, focus=True
+        )
+    if question.type != "question":
+        raise ValidationError(f"record expects a question node, got {question.type}: {question.id}")
+    text = read_answer_text(text=args.text, file=args.file, edit=args.edit)
+    if not text:
+        emit(
+            {"question": _node_json(question), "answer": None},
+            as_json=args.json,
+            human=f"No answer recorded; kept {question.id} — {question.title} open.",
+        )
+        return 0
+    answer = record_manual_answer(store, question.id, text, cursor=args.cursor)
+    question = store.load_node(question.id)
+    emit(
+        {"question": _node_json(question), "answer": _node_json(answer)},
+        as_json=args.json,
+        human=f"Recorded {answer.id} under {question.id} — {question.title}",
+    )
 
 
 def cmd_ask(args):
@@ -609,7 +639,23 @@ def build_parser() -> argparse.ArgumentParser:
     group = command.add_mutually_exclusive_group(required=True)
     group.add_argument("--text")
     group.add_argument("--file")
+    group.add_argument("--edit", action="store_true", help="write the answer in $EDITOR")
     command.set_defaults(func=cmd_answer)
+
+    command = sub.add_parser(
+        "record",
+        help="record questions and answers yourself (free, offline; interactive with no argument)",
+    )
+    command.add_argument(
+        "node",
+        nargs="?",
+        help="question reference (ID, prefix, focus, ..) or free-form question text",
+    )
+    group = command.add_mutually_exclusive_group()
+    group.add_argument("--text")
+    group.add_argument("--file")
+    group.add_argument("--edit", action="store_true", help="write the answer in $EDITOR")
+    command.set_defaults(func=cmd_record)
 
     command = sub.add_parser("ask", help="research a question with one model")
     command.add_argument(
