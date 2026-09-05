@@ -3,6 +3,16 @@
 All notable changes to Research Tree are documented here. The package follows semantic
 versioning; the on-disk graph format is versioned separately (`schema_version` on each object).
 
+## [Unreleased]
+
+### Added
+
+- `brainstorm [question-or-topic]`: generate independent research directions using String Seed of
+  Thought (SSoT) prompting. Saves model-generated seeds and candidate provenance, creates proposed
+  question branches, skips repeated titles, and preserves completed work if a later call fails.
+- Brainstorm model, reasoning effort, temperature, and candidate-count controls, a `--method direct`
+  comparison baseline, and an offline `--dry-run` preview with agent-friendly JSON.
+
 ## [0.4.0] - 2026-08-15
 
 ### Added

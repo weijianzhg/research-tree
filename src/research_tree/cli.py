@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .brainstorm import (
+    DEFAULT_IDEAS,
+    DEFAULT_TEMPERATURE,
+    METHODS,
+    prepare_brainstorm,
+    run_brainstorm,
+)
 from .doctor import inspect_graph
 from .errors import (
     ConfigurationError,
@@ -255,6 +262,71 @@ def cmd_ask(args):
     if outcome.run.usage.get("total_cost") is not None:
         human += f"\n\nRecorded cost: ${outcome.run.usage['total_cost']:.4f}"
     emit(_outcome_json(outcome), as_json=args.json, human=human)
+
+
+def cmd_brainstorm(args):
+    store = _store(args)
+    plan = prepare_brainstorm(
+        store,
+        args.node,
+        model=args.model,
+        ideas=args.ideas,
+        method=args.method,
+        reasoning_effort=args.effort,
+        temperature=args.temperature,
+        cursor=args.cursor,
+    )
+    if args.dry_run:
+        human = (
+            f"Brainstorm preview: {plan.ideas} independent calls to {plan.request['model']} "
+            f"using {plan.method}. No model calls or graph changes.\n\n"
+            + "\n\n".join(
+                f"{message['role'].upper()}:\n{message['content']}"
+                for message in plan.request["messages"]
+            )
+        )
+        emit(plan.to_dict(), as_json=args.json, human=human)
+        return
+    if not args.json:
+        print(
+            f"Brainstorming {plan.ideas} candidates with {plan.request['model']} "
+            f"({plan.method}); one call each, up to one retry for invalid output...",
+            file=sys.stderr,
+        )
+    outcome = run_brainstorm(store, plan, client=OpenRouterClient())
+    data = {
+        "question": _node_json(outcome.question),
+        "ideas": [_node_json(node) for node in outcome.ideas],
+        "run": outcome.run.to_dict(),
+    }
+    lines = [
+        f"Saved {len(outcome.ideas)} proposed branches under {outcome.question.id} "
+        f"— {outcome.question.title}",
+    ]
+    for sample in outcome.run.raw["samples"]:
+        if sample.get("disposition") != "proposed":
+            continue
+        idea = sample["parsed"]
+        lines.extend(
+            [
+                "",
+                f"{sample['node_id']} — {idea['question']}",
+                f"  Angle: {idea['angle']}",
+                f"  Why: {idea['rationale']}",
+                f"  First step: {idea['first_step']}",
+            ]
+        )
+    skipped = outcome.run.raw["duplicates_skipped"]
+    if skipped:
+        lines.append(
+            f"\nSkipped {skipped} repeated question titles; raw candidates remain in the run."
+        )
+    lines.append(f"\nRun: {outcome.run.id}")
+    if outcome.run.usage.get("total_cost") is not None:
+        lines.append(f"Recorded cost: ${outcome.run.usage['total_cost']:.4f}")
+    if outcome.ideas:
+        lines.append(f"Next: research-tree --root {store.root} ask {outcome.ideas[0].id}")
+    emit(data, as_json=args.json, human="\n".join(lines))
 
 
 def cmd_council(args):
@@ -672,6 +744,25 @@ def build_parser() -> argparse.ArgumentParser:
     command.set_defaults(web=None)
     command.add_argument("--followups", type=int, default=4)
     command.set_defaults(func=cmd_ask)
+
+    command = sub.add_parser("brainstorm", help="generate independent proposed research directions")
+    command.add_argument("node", nargs="?", default="focus", help="question reference or new topic")
+    command.add_argument("--model")
+    command.add_argument("--ideas", type=int, default=DEFAULT_IDEAS, help="candidate count (1–20)")
+    command.add_argument(
+        "--method",
+        choices=METHODS,
+        default="ssot",
+        help="SSoT (default) or a direct-prompt baseline",
+    )
+    command.add_argument("--effort", choices=["minimal", "low", "medium", "high", "xhigh", "max"])
+    command.add_argument(
+        "--temperature", type=float, default=DEFAULT_TEMPERATURE, help="sampling temperature (0–2)"
+    )
+    command.add_argument(
+        "--dry-run", action="store_true", help="preview prompts offline without saving"
+    )
+    command.set_defaults(func=cmd_brainstorm)
 
     command = sub.add_parser(
         "council", help="run independent answers, blind reviews, and synthesis"
