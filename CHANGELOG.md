@@ -12,6 +12,8 @@ versioning; the on-disk graph format is versioned separately (`schema_version` o
   question branches, skips repeated titles, and preserves completed work if a later call fails.
 - Brainstorm model, reasoning effort, temperature, and candidate-count controls, a `--method direct`
   comparison baseline, and an offline `--dry-run` preview with agent-friendly JSON.
+- Completed brainstorm work is preserved on Ctrl-C, with exit code `130` and the saved run ID.
+- Run files and JSON CLI exports preserve schema field order for SSoT's seed-first generation.
 
 ## [0.4.0] - 2026-08-15
 

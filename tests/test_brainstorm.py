@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from research_tree.brainstorm import prepare_brainstorm, run_brainstorm, validate_idea
-from research_tree.cli import EXIT_PROVIDER, EXIT_VALIDATION, main
+from research_tree.cli import EXIT_INTERRUPTED, EXIT_PROVIDER, EXIT_VALIDATION, main
 from research_tree.doctor import inspect_graph
 from research_tree.errors import ModelOutputError, ProviderError, ValidationError
 from research_tree.providers import ProviderResponse
@@ -35,7 +35,7 @@ class FakeClient:
     def chat(self, **kwargs):
         self.requests.append(copy.deepcopy(kwargs))
         value = next(self.outputs) if self.outputs is not None else idea_payload(len(self.requests))
-        if isinstance(value, Exception):
+        if isinstance(value, BaseException):
             raise value
         content = value if isinstance(value, str) else json.dumps(value)
         return ProviderResponse(
@@ -402,3 +402,63 @@ def test_cli_human_output_shows_usable_ideas_and_next_action(store, monkeypatch,
     assert "First step:" in captured.out
     assert "Next: research-tree" in captured.out
     assert "one call each" in captured.err
+
+
+def test_json_exports_preserve_seed_first_order(store, capsys):
+    plan = prepare_brainstorm(store, ideas=1)
+    assert main(["--root", str(store.root), "brainstorm", "--dry-run", "--json"]) == 0
+    preview = json.loads(capsys.readouterr().out)["data"]
+    assert list(preview["request"]["response_schema"]["properties"])[0] == "random_string"
+
+    outcome = run_brainstorm(store, plan, client=FakeClient())
+    saved = store.load_run(outcome.run.id)
+    assert list(saved.raw["request"]["response_schema"]["properties"])[0] == "random_string"
+    validate_idea(saved.raw["samples"][0]["parsed"], "ssot")
+
+    assert main(["--root", str(store.root), "run", "show", saved.id, "--json"]) == 0
+    exported = json.loads(capsys.readouterr().out)["data"]
+    assert list(exported["raw"]["request"]["response_schema"]["properties"])[0] == "random_string"
+    validate_idea(exported["raw"]["samples"][0]["parsed"], "ssot")
+
+
+def test_cancellation_preserves_completed_calls_and_valid_ideas(store):
+    client = FakeClient([idea_payload(), KeyboardInterrupt()])
+    plan = prepare_brainstorm(store, ideas=5)
+    with pytest.raises(KeyboardInterrupt, match="saved.*run r_"):
+        run_brainstorm(store, plan, client=client)
+    assert len(client.requests) == 2
+    run = store.load_run(next(store.runs_dir.glob("*.json")).stem)
+    assert run.raw["status"] == "interrupted"
+    assert len(run.response_node_ids) == 1
+    assert run.usage["total_cost"] == pytest.approx(0.01)
+    assert run.raw["samples"][1]["error"] == "interrupted by user"
+    assert store.load_node("root").status == "open"
+    assert inspect_graph(store).healthy
+
+
+@pytest.mark.parametrize("completed", [0, 1])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_cli_cancellation_returns_saved_run_and_exit_130(
+    store, monkeypatch, capsys, completed, as_json
+):
+    outputs = [idea_payload()] * completed + [KeyboardInterrupt()]
+    monkeypatch.setattr("research_tree.cli.OpenRouterClient", lambda: FakeClient(outputs))
+    args = ["--root", str(store.root), "brainstorm", "--ideas", "5"]
+    if as_json:
+        args.append("--json")
+    assert main(args) == EXIT_INTERRUPTED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    run = store.load_run(next(store.runs_dir.glob("*.json")).stem)
+    assert run.raw["status"] == "interrupted"
+    assert len(run.response_node_ids) == completed
+    assert len(run.usage["calls"]) == completed
+    if as_json:
+        error = json.loads(captured.err)
+        assert error["ok"] is False
+        assert error["exit_code"] == EXIT_INTERRUPTED
+        assert run.id in error["error"]
+    else:
+        assert run.id in captured.err
+        assert "Traceback" not in captured.err
+    assert inspect_graph(store).healthy

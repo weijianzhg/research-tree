@@ -53,6 +53,7 @@ from .store import GraphStore, _atomic_write, load_store
 EXIT_NOT_FOUND = 3
 EXIT_PROVIDER = 4
 EXIT_VALIDATION = 5
+EXIT_INTERRUPTED = 130
 
 
 def _node_json(node) -> dict[str, Any]:
@@ -81,13 +82,14 @@ def _verification_json(outcome) -> dict[str, Any]:
 
 def emit(data: Any, *, as_json: bool, human: str | None = None) -> None:
     if as_json:
-        print(json.dumps({"ok": True, "data": data}, indent=2, ensure_ascii=False, sort_keys=True))
+        # Schema property order steers SSoT generation; exported requests must keep it.
+        print(json.dumps({"ok": True, "data": data}, indent=2, ensure_ascii=False))
     elif human is not None:
         print(human)
     elif isinstance(data, str):
         print(data)
     else:
-        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def _store(args) -> GraphStore:
@@ -882,6 +884,9 @@ def main(argv: list[str] | None = None) -> int:
     except ResearchTreeError as exc:
         code = EXIT_VALIDATION
         error_message = str(exc)
+    except KeyboardInterrupt as exc:
+        code = EXIT_INTERRUPTED
+        error_message = str(exc) or "interrupted by user"
     if args.json:
         print(
             json.dumps({"ok": False, "error": error_message, "exit_code": code}),

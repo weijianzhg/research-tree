@@ -136,8 +136,9 @@ The default is five candidates, at temperature `0.6`, using the project's model 
 effort. `--model`, `--effort`, `--temperature`, and `--ideas` (1–20) override those choices. Five
 candidates normally cost five completions. Invalid output is retried once per candidate; exhausted
 validation or provider failure stops the batch, preserves completed calls and valid ideas, and
-returns the usual error code. Repeated question titles are skipped without extra replacement calls,
-so the number of new branches can be smaller than the candidate count.
+returns the usual error code. Pressing Ctrl-C during generation also saves completed work and
+returns exit code `130` with the saved run ID. Repeated question titles are skipped without extra
+replacement calls, so the number of new branches can be smaller than the candidate count.
 
 Agents can inspect the exact request without credentials, paid calls, or graph changes:
 
@@ -177,8 +178,8 @@ research-tree --root ./research --cursor pi-session-42 where
 ```
 
 Every command supports `--json` for agents and scripts. Expected failures use stable exit codes:
-`3` not found, `4` provider/configuration, and `5` validation/integrity (including model output
-that fails to parse or validate).
+`3` not found, `4` provider/configuration, `5` validation/integrity (including model output
+that fails to parse or validate), and `130` interrupted.
 
 ## Writing workflow
 

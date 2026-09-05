@@ -88,13 +88,17 @@ question's status is preserved; ideas are not answers or supported claims.
 The run's `raw` object records the method, prompt version, candidate count, frozen request (including
 schema and sampling parameters), full prompts, and ordered `samples`. Each sample holds every
 completed attempt's raw response, content, model IDs, and usage; invalid attempts also carry an error.
+Run files and JSON CLI exports preserve object field order, including the SSoT schema's first
+`random_string` field, so inspecting or reusing an exported request retains its generation order.
 A valid sample has a `parsed` idea, including `random_string` for SSoT, and a `disposition` of
 `proposed` or `duplicate` with its corresponding `node_id`. Duplicate candidates remain inspectable
 even though they create no node. Only title equivalence is checked, not semantic novelty.
 
-`status` is `completed`, `partial`, `failed_validation`, or `failed_provider`. A failed batch may
-still contain usable branches. `response_node_ids` contains only newly created ideas. Model lists
-and `usage.calls` cover all completed responses, including retries; a transport failure with no
+`status` is `completed`, `partial`, `failed_validation`, `failed_provider`, or `interrupted`.
+Ctrl-C during generation saves completed responses and valid candidates before exiting with code
+`130`. A failed or interrupted batch may still contain usable branches. `response_node_ids`
+contains only newly created ideas. Model lists and `usage.calls` cover all completed responses,
+including retries; a transport failure with no
 response is recorded in the sample's error instead. Cost is included only when reported by the
 provider. All new nodes, the run, parent provenance, and generated views are written transactionally.
 

@@ -240,7 +240,7 @@ def _persist_brainstorm(
     plan: BrainstormPlan,
     samples: list[dict[str, Any]],
     responses: list[ProviderResponse],
-    failure: Exception | None,
+    failure: BaseException | None,
 ) -> BrainstormOutcome:
     run_id = new_id("run")
     created = utc_now()
@@ -289,7 +289,9 @@ def _persist_brainstorm(
             sample.update(disposition="proposed", node_id=node.id)
 
         status = "completed"
-        if failure:
+        if isinstance(failure, KeyboardInterrupt):
+            status = "interrupted"
+        elif failure:
             status = (
                 "partial"
                 if nodes
@@ -365,40 +367,52 @@ def run_brainstorm(
         raise ValidationError("this brainstorm plan has already created its question")
     samples: list[dict[str, Any]] = []
     responses: list[ProviderResponse] = []
-    failure: Exception | None = None
-    for index in range(plan.ideas):
-        sample: dict[str, Any] = {"index": index + 1, "attempts": []}
-        samples.append(sample)
-        for attempt in range(MAX_OUTPUT_ATTEMPTS):
-            # Each request uses the same frozen context. No candidate sees another candidate.
-            try:
-                response = client.chat(**copy.deepcopy(plan.request))
-            except (ProviderError, ConfigurationError) as exc:
-                failure = exc
-                sample["error"] = str(exc)
-                break
-            responses.append(response)
-            record = {
-                "response": response.raw,
-                "content": response.content,
-                "requested_model": response.requested_model,
-                "resolved_model": response.resolved_model,
-                "usage": response.usage,
-            }
-            sample["attempts"].append(record)
-            try:
-                sample["parsed"] = validate_idea(parse_json_content(response.content), plan.method)
-                break
-            except ModelOutputError as exc:
-                record["error"] = str(exc)
-                if attempt == MAX_OUTPUT_ATTEMPTS - 1:
+    failure: BaseException | None = None
+    try:
+        for index in range(plan.ideas):
+            sample: dict[str, Any] = {"index": index + 1, "attempts": []}
+            samples.append(sample)
+            for attempt in range(MAX_OUTPUT_ATTEMPTS):
+                # Each request uses the same frozen context. No candidate sees another candidate.
+                try:
+                    response = client.chat(**copy.deepcopy(plan.request))
+                except (ProviderError, ConfigurationError) as exc:
                     failure = exc
                     sample["error"] = str(exc)
-        if failure:
-            break
+                    break
+                responses.append(response)
+                record = {
+                    "response": response.raw,
+                    "content": response.content,
+                    "requested_model": response.requested_model,
+                    "resolved_model": response.resolved_model,
+                    "usage": response.usage,
+                }
+                sample["attempts"].append(record)
+                try:
+                    sample["parsed"] = validate_idea(
+                        parse_json_content(response.content), plan.method
+                    )
+                    break
+                except ModelOutputError as exc:
+                    record["error"] = str(exc)
+                    if attempt == MAX_OUTPUT_ATTEMPTS - 1:
+                        failure = exc
+                        sample["error"] = str(exc)
+            if failure:
+                break
+    except KeyboardInterrupt:
+        failure = KeyboardInterrupt("interrupted by user")
+        if samples:
+            samples[-1]["error"] = str(failure)
     outcome = _persist_brainstorm(store, plan, samples, responses, failure)
     if failure:
-        error_type = ModelOutputError if isinstance(failure, ModelOutputError) else ProviderError
+        if isinstance(failure, KeyboardInterrupt):
+            error_type = KeyboardInterrupt
+        elif isinstance(failure, ModelOutputError):
+            error_type = ModelOutputError
+        else:
+            error_type = ProviderError
         raise error_type(
             f"brainstorm stopped; saved {len(outcome.ideas)} proposed branches and completed "
             f"calls in run {outcome.run.id}: {failure}"
