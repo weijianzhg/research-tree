@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from research_tree.providers import openrouter
 from research_tree.providers.openrouter import (
     OpenRouterClient,
@@ -28,7 +30,8 @@ def test_normalize_model_id_strips_pi_tilde_alias():
     assert normalize_model_id("openai/gpt-5-mini") == "openai/gpt-5-mini"
 
 
-def test_chat_sends_reasoning_web_tools_and_json_schema(monkeypatch):
+@pytest.mark.parametrize("overrides,temperature", [({}, 0.2), ({"temperature": 0.6}, 0.6)])
+def test_chat_sends_reasoning_web_tools_and_json_schema(monkeypatch, overrides, temperature):
     captured = {}
 
     class FakeHTTPResponse:
@@ -62,9 +65,11 @@ def test_chat_sends_reasoning_web_tools_and_json_schema(monkeypatch):
         web=True,
         reasoning_effort="high",
         response_schema=ANSWER_SCHEMA,
+        **overrides,
     )
     assert captured["url"] == "https://router.test/v1/chat/completions"
     assert captured["payload"]["model"] == "requested/model"
+    assert captured["payload"]["temperature"] == temperature
     assert captured["payload"]["reasoning"]["effort"] == "high"
     assert captured["payload"]["tools"][0]["type"] == "openrouter:web_search"
     assert captured["payload"]["response_format"]["type"] == "json_schema"

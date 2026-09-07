@@ -109,6 +109,51 @@ one synthesis), so it is intentionally explicit rather than automatic.
 
 The council idea is inspired by [Andrej Karpathy's LLM Council](https://github.com/karpathy/llm-council).
 
+## Brainstorm research directions
+
+```bash
+research-tree --root ./research brainstorm focus --ideas 5
+research-tree --root ./research brainstorm "How could expert routing adapt at inference time?" \
+  --model 'deepseek/deepseek-v4-pro-0813' --ideas 5 --json
+research-tree --root ./research ask q_abc123
+```
+
+`brainstorm` defaults to **String Seed of Thought (SSoT)**, adapted from
+[Sakana AI's research](https://pub.sakana.ai/ssot/). Each independent model call first generates
+its own random string and uses it to select a perspective, method, and scope before developing
+one idea. All calls share a frozen topic/context; candidates do not see one another's outputs.
+This is a prompting technique, not the provider's numeric decoding seed. The
+[paper's external-randomness comparison](https://arxiv.org/html/2510.21150v3#A4.SS6) is why the
+default generates the string inside the model rather than injecting a string from Python.
+
+Each idea becomes a `proposed` child question with an angle, rationale, first step, and assumptions
+to test. Brainstorming does not search the web or mark the topic answered. Use `ask` on a promising
+branch to investigate it with evidence. Existing question status and focus are preserved; a
+free-form topic creates and focuses a new question under the current focus. Seeds, full prompts,
+model IDs, candidate outputs (including duplicates), and usage are saved in the immutable run.
+
+The default is five candidates, at temperature `0.6`, using the project's model and reasoning
+effort. `--model`, `--effort`, `--temperature`, and `--ideas` (1–20) override those choices. Five
+candidates normally cost five completions. Invalid output is retried once per candidate; exhausted
+validation or provider failure stops the batch, preserves completed calls and valid ideas, and
+returns the usual error code. Pressing Ctrl-C during generation also saves completed work and
+returns exit code `130` with the saved run ID. Repeated question titles are skipped without extra
+replacement calls, so the number of new branches can be smaller than the candidate count.
+
+Agents can inspect the exact request without credentials, paid calls, or graph changes:
+
+```bash
+research-tree --root ./research brainstorm focus --ideas 5 --dry-run --json
+```
+
+Use `--method direct` for an independent-call baseline without the seed instruction. Compare methods
+on copies of the same starting graph, with the same topic, model, effort, temperature, and candidate
+count, so earlier generated branches do not bias the second run. Assess distinct research directions
+and usefulness, not just different wording. Title deduplication does not measure semantic diversity.
+This JSON adaptation has not been benchmarked across models; SSoT does not guarantee novel or better
+ideas, and its benefit depends on the model. Recorded seeds provide provenance, not deterministic
+replay of the model's output.
+
 ## Navigation
 
 ```bash
@@ -133,8 +178,8 @@ research-tree --root ./research --cursor pi-session-42 where
 ```
 
 Every command supports `--json` for agents and scripts. Expected failures use stable exit codes:
-`3` not found, `4` provider/configuration, and `5` validation/integrity (including model output
-that fails to parse or validate).
+`3` not found, `4` provider/configuration, `5` validation/integrity (including model output
+that fails to parse or validate), and `130` interrupted.
 
 ## Writing workflow
 
@@ -188,6 +233,7 @@ binary database. See [the format contract](docs/format.md) for entity and relati
 | `answer` | Record a human/manual answer |
 | `record` | Record questions and answers yourself (free, offline; interactive) |
 | `ask` | Run one evidence-aware model |
+| `brainstorm` | Generate independent research directions with SSoT or direct prompting |
 | `council` | Compare models through blind review and synthesis |
 | `verify` | Check claim-level citation support against frozen excerpts |
 | `synthesize` | Merge answered questions into one `y_` synthesis node |

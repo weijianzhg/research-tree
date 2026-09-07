@@ -73,8 +73,8 @@ def _fsync_tree(root: Path) -> None:
         _fsync_directory(directory)
 
 
-def _json_text(data: dict[str, Any]) -> str:
-    return json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+def _json_text(data: dict[str, Any], *, sort_keys: bool = True) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False, sort_keys=sort_keys) + "\n"
 
 
 class GraphStore:
@@ -953,7 +953,8 @@ class GraphStore:
             path = self.run_path(run.id)
             if path.exists():
                 raise ValidationError(f"model run is immutable and already exists: {run.id}")
-            self._write_text(path, _json_text(run.to_dict()))
+            # Retain the order of schema properties and parsed outputs in model provenance.
+            self._write_text(path, _json_text(run.to_dict(), sort_keys=False))
 
     def load_run(self, run_id: str) -> ModelRun:
         with self.read_locked():

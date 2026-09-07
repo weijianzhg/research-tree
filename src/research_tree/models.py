@@ -33,7 +33,7 @@ EDGE_TYPES = {
     "derived_from",
     "supersedes",
 }
-RUN_MODES = {"ask", "council", "verify", "synthesize"}
+RUN_MODES = {"ask", "council", "verify", "synthesize", "brainstorm"}
 ID_RE = re.compile(r"^(p|q|a|c|k|y|n|s|r)_[a-f0-9]{12}$")
 
 PREFIXES = {

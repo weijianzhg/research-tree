@@ -129,6 +129,7 @@ class OpenRouterClient:
         response_schema: dict[str, Any] | None = None,
         max_tokens: int = 8000,
         max_search_results: int = 8,
+        temperature: float = 0.2,
     ) -> ProviderResponse:
         key = self.api_key or resolve_openrouter_key(model)
         api_model = normalize_model_id(model)
@@ -136,7 +137,7 @@ class OpenRouterClient:
             "model": api_model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.2,
+            "temperature": temperature,
         }
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort, "exclude": True}
